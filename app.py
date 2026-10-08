@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 import streamlit as st
-"""Read cached worksheet values without running workbook macros or formulas."""
+# Read cached worksheet values without running workbook macros or formulas.
 import io
 import re
 import zipfile
