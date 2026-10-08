@@ -103,9 +103,49 @@ if not preview and not st.session_state.get("auth"):
             else:
                 try:
                     api("/auth/v1/signup", "POST", {"email": signup_email.strip(), "password": signup_password})
-                    st.success("가입 요청을 처리했어요. 인증 이메일이 도착하면 인증 후 로그인해주세요.")
+                    st.info("신규 계정이면 인증 메일을 확인해주세요. 이미 가입한 이메일은 다시 가입해도 비밀번호가 바뀌지 않습니다. 비밀번호를 모르면 아래 ‘비밀번호 재설정’을 이용해주세요.")
                 except RuntimeError:
                     st.error("가입 요청을 처리하지 못했어요. Supabase 이메일 가입 설정을 확인해주세요.")
+    with st.expander("비밀번호 재설정"):
+        st.caption("회사 이메일로 인증번호를 받은 뒤 새 비밀번호를 정해주세요.")
+        with st.form("recovery_send"):
+            recovery_email = st.text_input("재설정할 이메일").strip().lower()
+            send_recovery = st.form_submit_button("인증번호 이메일 보내기")
+        if send_recovery:
+            if not recovery_email or "@" not in recovery_email:
+                st.error("이메일을 입력해주세요.")
+            elif time.time() < st.session_state.get("recovery_sent_at", 0) + 60:
+                st.warning("재발송은 1분 뒤에 시도해주세요.")
+            else:
+                try:
+                    api("/auth/v1/recover", "POST", {"email": recovery_email})
+                    st.session_state.recovery_email = recovery_email
+                    st.session_state.recovery_sent_at = time.time()
+                    st.session_state.pop("recovery_session", None)
+                    st.success("등록된 이메일이면 재설정 메일이 발송됩니다. 스팸함도 확인해주세요.")
+                except (RuntimeError, urllib.error.URLError) as error:
+                    st.error("메일 발송 요청 실패: " + str(error))
+        with st.form("recovery_verify", clear_on_submit=True):
+            verify_email = st.text_input("인증할 이메일", value=st.session_state.get("recovery_email", "")).strip().lower()
+            recovery_code = st.text_input("메일의 인증번호", type="password")
+            new_password = st.text_input("새 비밀번호 (8자 이상)", type="password")
+            confirm_password = st.text_input("새 비밀번호 확인", type="password")
+            reset_password = st.form_submit_button("비밀번호 변경")
+        if reset_password:
+            if len(new_password) < 8 or new_password != confirm_password:
+                st.error("8자 이상의 같은 비밀번호를 두 번 입력해주세요.")
+            else:
+                try:
+                    recovery = st.session_state.get("recovery_session", {})
+                    if recovery.get("email") != verify_email or recovery.get("expires_at", 0) < time.time():
+                        verified = api("/auth/v1/verify", "POST", {"email": verify_email, "token": recovery_code.strip(), "type": "recovery"})
+                        recovery = {"email": verify_email, "access_token": verified["access_token"], "expires_at": time.time() + min(verified.get("expires_in", 3600), 600)}
+                        st.session_state.recovery_session = recovery
+                    api("/auth/v1/user", "PUT", {"password": new_password}, token=recovery["access_token"])
+                    st.session_state.pop("recovery_session", None)
+                    st.success("비밀번호를 변경했어요. 위 로그인 칸에서 새 비밀번호로 로그인해주세요.")
+                except (RuntimeError, urllib.error.URLError) as error:
+                    st.error("비밀번호 재설정 실패: " + str(error))
     st.stop()
 
 try:
