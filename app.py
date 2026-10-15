@@ -95,7 +95,7 @@ def parse_order_workbook(blob, filename, source_url=""):
                 "sourceFile": filename, "sourceSheet": "Open SO Status", "sourceUrl": source_url,
                 "checkedAt": datetime.now(timezone.utc).isoformat(), "sourceRows": len(rows) - header[0]}
 
-"""Evidence-based weekly reporting; no external AI calls or workbook writes."""
+# Evidence-based weekly reporting; no external AI calls or workbook writes.
 import copy
 import hashlib
 import json
