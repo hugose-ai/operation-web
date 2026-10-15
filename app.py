@@ -99,6 +99,7 @@ def parse_order_workbook(blob, filename, source_url=""):
 import copy
 import hashlib
 import json
+import html
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -207,6 +208,59 @@ def weekly_evidence(body, person, week):
     fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
     return evidence, fingerprint
 
+def weekly_parse_rows(text):
+    rows = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split('\t')
+        if len(parts) != 2 or not all(x.strip() for x in parts):
+            raise ValueError('한 줄에 고객사와 영어 요약을 탭으로 구분해주세요.')
+        category, summary = (x.strip() for x in parts)
+        if category.startswith(('=', '+', '-', '@')) or summary.startswith(('=', '+', '-', '@')):
+            raise ValueError('수식 대신 일반 문장으로 입력해주세요.')
+        if len(summary.split()) > 65:
+            raise ValueError(category + ': 고객사당 1~2문장, 65단어 이내로 줄여주세요.')
+        if category.casefold() in [r['category'].casefold() for r in rows]:
+            raise ValueError('같은 고객사는 한 줄로 합쳐주세요: ' + category)
+        rows.append(dict(category=category, summary=summary))
+    return rows
+
+
+def weekly_copy_table(st, rows):
+    cell = 'border:1px solid #000;padding:6px 10px;font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;white-space:normal;vertical-align:middle;'
+    head = '<tr>' + ''.join('<th style="' + cell + 'background:#DEEAF6;text-align:center;font-weight:bold;">' + x + '</th>' for x in ['Category', 'Review / Plan']) + '</tr>'
+    content = ''.join('<tr><td style="' + cell + 'background:#fff;width:160px;">' + html.escape(r['category']) + '</td><td style="' + cell + 'background:#fff;">' + html.escape(r['summary']) + '</td></tr>' for r in rows)
+    table = lambda inner: '<table style="border-collapse:collapse;width:100%;table-layout:fixed;"><colgroup><col style="width:160px"><col></colgroup>' + inner + '</table>'
+    plain = '\n'.join(r['category'] + '\t' + r['summary'] for r in rows)
+    component = st.components.v2.component('weekly_customer_copy_v2', html='<div id="weekly-copy"></div>', js="""
+export default function(component) {
+  const {parentElement, data} = component;
+  const root = parentElement.querySelector('#weekly-copy');
+  root.innerHTML = '<div style="display:flex;gap:8px;margin:0 0 12px"><button id="body">내용 복사 · E:F</button><button id="all">헤더·서식 포함 복사</button><span role="status"></span></div>' + data.preview;
+  root.querySelectorAll('button').forEach(b => {b.style.cssText='padding:9px 14px;border:1px solid #7195bb;border-radius:6px;background:#235b92;color:white;cursor:pointer';});
+  for (const mode of ['body','all']) root.querySelector('#'+mode).onclick = async () => {
+    const plain = mode === 'all' ? 'Category\\tReview / Plan\\n'+data.plain : data.plain;
+    const rich = mode === 'all' ? data.preview : data.body;
+    const status = root.querySelector('[role=status]');
+    try {
+      await navigator.clipboard.write([new ClipboardItem({'text/plain':new Blob([plain],{type:'text/plain'}),'text/html':new Blob([rich],{type:'text/html'})})]);
+      status.textContent='복사했어요 · 시트 E열에 붙여넣기';
+    } catch (_) {
+      const handler = e => {e.clipboardData.setData('text/plain',plain);e.clipboardData.setData('text/html',rich);e.preventDefault();};
+      document.addEventListener('copy',handler);
+      const ok = document.execCommand('copy');
+      document.removeEventListener('copy',handler);
+      status.textContent=ok ? '복사했어요 · 시트 E열에 붙여넣기' : '복사가 차단됐어요. 아래 텍스트 복사를 이용해주세요.';
+    }
+  };
+}
+""")
+    component(data=dict(preview=table(head + content), body=table(content), plain=plain), key='weekly_customer_table')
+    with st.expander('텍스트 복사 · 서식 없이 붙여넣기'):
+        st.code(plain, language=None, wrap_lines=True)
+
+
 def weekly_render(st, body, actor, save):
     st.header('Weekly · 주간 보고')
     st.caption('기록은 주차별로 모이고, 영어 초안은 업무시간 중 매시간 정리됩니다. 원문을 확인한 뒤 복사하세요.')
@@ -221,30 +275,30 @@ def weekly_render(st, body, actor, save):
     key = week + ':' + person
     draft = body.get('weeklyDrafts', {}).get(key, {})
     st.subheader(f"{person} · Week of {date.fromisoformat(week).strftime('%m/%d')}–{friday}")
-    st.caption(f"지난주 실적: {evidence['previousWeek']}부터 7일 / 이번 주 목표: {week}부터 7일 · 뉴욕 기준")
-    if not draft:
-        st.info('영어 초안 준비 중입니다. 오른쪽 원문 근거는 바로 확인할 수 있어요.')
+    st.caption(f"이번 주 활동: {week}부터 7일 · 고객사별 1~2문장 · 뉴욕 기준")
+    if draft.get('formatVersion') != 2:
+        st.info('고객사별 짧은 초안 준비 중입니다. 기존 초안은 아래에 보관되어 있어요.')
     elif draft.get('fingerprint') != fingerprint:
         st.warning('새 기록이 있습니다. 아래 영어 초안은 아직 최신 기록을 모두 반영하지 않았어요.')
     else:
         st.success('현재 수집된 기록을 반영한 영어 초안입니다.')
     if draft:
         st.caption('초안 정리 시각: ' + draft.get('updatedAt', '') + ' · ' + draft.get('by', ''))
-    left, right = st.columns([1, 1])
-    with left:
-        st.markdown('#### 복사할 영어 초안')
-        sections = draft.get('sections', {})
-        for label in WEEKLY_SECTIONS:
-            st.markdown('**' + label + '**')
-            st.code(sections.get(label, 'Draft pending.'), language=None, wrap_lines=True)
-        full = '\n\n'.join(label + '\n' + sections.get(label, 'Draft pending.') for label in WEEKLY_SECTIONS)
-        with st.expander('전체 한 번에 복사'):
-            st.code(full, language=None, wrap_lines=True)
-    with right:
-        st.markdown('#### 원문 근거 · 작성자와 날짜')
+    st.markdown('#### 복사할 영어 초안')
+    st.caption('Weekly 시트의 해당 주차 E열 첫 내용 셀에 붙여넣으세요. 고객사는 E열, 요약은 F열에 들어갑니다. 헤더가 이미 있으면 ‘내용 복사’를 사용하세요.')
+    if draft.get('formatVersion') == 2 and draft.get('rows'):
+        weekly_copy_table(st, draft['rows'])
+    elif draft.get('formatVersion') == 2:
+        st.info('이번 주에 요약할 활동이 아직 없습니다.')
+    if draft.get('sections'):
+        with st.expander('이전 6항목 초안 · 보관'):
+            for label, text in draft['sections'].items():
+                st.markdown('**' + label + '**')
+                st.write(text)
+    with st.expander('원문 근거 · 작성자와 날짜'):
         st.caption('과거 기록이 부족한 주는 빈 부분이 생길 수 있습니다. 완료와 계획을 구분하며, 오더 건수는 자동 성과로 포함하지 않습니다.')
         for label, lo, hi in [('지난주 기록', evidence['previousWeek'], week), ('이번 주 진행 기록', week, (date.fromisoformat(week)+timedelta(days=7)).isoformat())]:
-            with st.expander(label, expanded=True):
+            with st.expander(label, expanded=False):
                 matched = [x for x in evidence['activity'] if lo <= weekly_day(x['at']) < hi]
                 if not matched:
                     st.caption('날짜와 작성자가 확인되는 기록이 없습니다.')
@@ -257,7 +311,7 @@ def weekly_render(st, body, actor, save):
                     for field in x.get('fields', []):
                         if field in ['note','result','link','emailSubject','progress','status','due','helpRequest'] and t.get(field) is not None:
                             st.write(f"{field}: {t[field]}")
-        with st.expander('이번 주 목표 · 담당 업무', expanded=True):
+        with st.expander('이번 주 목표 · 담당 업무', expanded=False):
             for t in evidence['plans']:
                 st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress') or 0}% · 마감 {t.get('due') or '미정'} · 담당 {t.get('owner')}")
         with st.expander('초안 작성용 원문 데이터'):
@@ -265,18 +319,23 @@ def weekly_render(st, body, actor, save):
             st.caption('근거 ID: ' + fingerprint)
     with st.expander('영어 초안 편집 / 저장'):
         with st.form('weekly_draft_' + key + '_' + fingerprint):
-            edited = {label: st.text_area(label, value=draft.get('sections', {}).get(label, ''), height=120) for label in WEEKLY_SECTIONS}
+            st.caption('한 줄에 고객사 → 탭 → 영어 요약. 고객사당 이번 주 활동 1~2문장만 작성하세요.')
+            edited = st.text_area('고객사별 영어 요약 · 탭으로 구분', value='\n'.join(r['category'] + '\t' + r['summary'] for r in draft.get('rows', [])), height=240)
             if st.form_submit_button('영어 초안 저장'):
                 def update(latest):
                     _, actual = weekly_evidence(latest, person, week)
                     if actual != fingerprint:
                         raise RuntimeError('새 업무 기록이 들어왔어요. 새로고침 후 최신 근거로 저장해주세요.')
-                    latest.setdefault('weeklyDrafts', {})[key] = dict(sections=edited, fingerprint=fingerprint,
+                    current_draft = latest.get('weeklyDrafts', {}).get(key, {})
+                    if current_draft != draft:
+                        raise RuntimeError('다른 사람이 초안을 수정했어요. 새로고침 후 다시 저장해주세요.')
+                    latest.setdefault('weeklyDrafts', {})[key] = dict(current_draft, rows=parsed, formatVersion=2, fingerprint=fingerprint,
                         updatedAt=datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M'), by=actor)
                 try:
+                    parsed = weekly_parse_rows(edited)
                     save(update, person + ' Weekly 영어 초안을 정리했어요')
                     st.rerun()
-                except RuntimeError as exc:
+                except (RuntimeError, ValueError) as exc:
                     st.error(str(exc))
 
 
