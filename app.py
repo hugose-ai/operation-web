@@ -100,6 +100,9 @@ import copy
 import hashlib
 import json
 import html
+# Reference layout only; no source report contents.
+WEEKLY_TEMPLATES = {'Hugo': {'rows': [[{'ref': 'B1', 'text': '🫡', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'C1', 'text': 'Hugo', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'D1', 'text': 'Goal / Priority / Deliverable', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E1', 'text': 'Category', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F1', 'text': 'Review / Plan', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}], [{'ref': 'B2', 'text': 'Agenda', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [16, 1], 'slot': False}, {'ref': 'C2', 'text': '1. Previous Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [3, 1], 'slot': False}, {'ref': 'D2', 'text': 'Summary of Previous Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E2', 'text': 'US', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F2', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'D3', 'text': 'Meaningful Accomplishments', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E3', 'text': 'US', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'D4', 'text': 'Biggest Roadblock(s)', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E4', 'text': 'Amazon', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F4', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'C5', 'text': '2. This Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [13, 1], 'slot': False}, {'ref': 'D5', 'text': 'This Weeks Goals', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [13, 1], 'slot': False}, {'ref': 'E5', 'text': 'Line Review', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'F5', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F6', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F7', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F8', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F9', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F10', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F11', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E12', 'text': 'Excessive Units', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F12', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E13', 'text': 'Amazon', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F13', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E14', 'text': 'EU', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F14', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E15', 'text': 'Channel Setup', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;', 'span': [3, 1], 'slot': False}, {'ref': 'F15', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F16', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F17', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'B18', 'text': 'Additional Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 4], 'slot': False}, {'ref': 'F18', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}]], 'widths': [9.29, 10.86, 28.29, 9.43, 103.43], 'slots': ['F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17', 'F18'], 'sourceStart': 1156}, 'Jayna': {'rows': [[{'ref': 'B1', 'text': '🦋', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'C1', 'text': 'Jayna', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'D1', 'text': 'Goal / Priority / Deliverable', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'F1', 'text': 'Review / Plan', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}], [{'ref': 'B2', 'text': 'Previous Week Meeting Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'D2', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 3], 'slot': True}], [{'ref': 'B3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'C3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'D3', 'text': 'Ongoing', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'E3', 'text': 'Power Bank Compliance', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FCE5CD;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E4', 'text': 'EOT Series main image refresh', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F4', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E5', 'text': 'Amazon Andon Cord ', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F5', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E6', 'text': 'BBY MP / Macys MP', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F6', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E7', 'text': 'AAFES', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F7', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E8', 'text': 'TikTok', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F8', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E9', 'text': 'NL Shipment Status', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#EAD1DC;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F9', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'B10', 'text': 'Final Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'D10', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 3], 'slot': True}]], 'widths': [15.0, 17.57, 15.86, 28.57, 120.57], 'slots': ['D2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'D10'], 'sourceStart': 522}}
+
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -176,6 +179,10 @@ def weekly_capture(old, new, actor, stamp=None):
                    if x.get('status') == 'active' and not x.get('daily') and
                    (x.get('weekGoal') == week or week <= (x.get('due') or '') <= end)]
     new['weeklyPlans'] = plans
+    progress = copy.deepcopy(old.get('weeklyProgress', {}))
+    progress[week] = [weekly_snapshot(x) for x in new.get('items', [])
+                      if x.get('status') == 'active' and not x.get('daily') and x.get('progress', 0)]
+    new['weeklyProgress'] = progress
 
 def weekly_evidence(body, person, week):
     start = date.fromisoformat(week)
@@ -201,64 +208,71 @@ def weekly_evidence(body, person, week):
     else:
         plans = view.get('weeklyPlans', {}).get(week, [])
     plans = [x for x in plans if weekly_person(x.get('owner')) == person or x.get('owner') == '함께']
+    progress = ([weekly_snapshot(x) for x in body.get('items', [])
+                 if x.get('status') == 'active' and not x.get('daily') and x.get('progress', 0)]
+                if week == current else body.get('weeklyProgress', {}).get(week, []))
+    progress = [x for x in progress if weekly_person(x.get('owner')) == person or x.get('owner') == '함께']
     evidence = dict(person=person, reportWeek=week, previousWeek=previous,
-                    activity=sorted(records, key=lambda x: x['at']), plans=plans,
+                    activity=sorted(records, key=lambda x: x['at']), plans=plans, progress=progress,
                     trackingSince=body.get('weeklyTrackingSince'),
                     note='Activity is attributed to the actual editor; plans to the assigned owner. Shared tasks are not individual accomplishments. Legacy notes are latest available versions only. Do not infer earlier work, completion, or order-processing counts.')
     fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
     return evidence, fingerprint
 
-def weekly_parse_rows(text):
-    rows = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split('\t')
-        if len(parts) != 2 or not all(x.strip() for x in parts):
-            raise ValueError('한 줄에 고객사와 영어 요약을 탭으로 구분해주세요.')
-        category, summary = (x.strip() for x in parts)
-        if category.startswith(('=', '+', '-', '@')) or summary.startswith(('=', '+', '-', '@')):
-            raise ValueError('수식 대신 일반 문장으로 입력해주세요.')
-        if len(summary.split()) > 65:
-            raise ValueError(category + ': 고객사당 1~2문장, 65단어 이내로 줄여주세요.')
-        if category.casefold() in [r['category'].casefold() for r in rows]:
-            raise ValueError('같은 고객사는 한 줄로 합쳐주세요: ' + category)
-        rows.append(dict(category=category, summary=summary))
-    return rows
+def weekly_template_values(person, draft, evidence):
+    template = WEEKLY_TEMPLATES[person]
+    values = {ref: draft.get('cells', {}).get(ref, '') for ref in template['slots']}
+    fallback = 'F18' if person == 'Hugo' else 'D10'
+    for task in evidence.get('progress', []):
+        mapping = draft.get('progressLabels', {}).get(task['id'], {})
+        ref = mapping.get('cell', fallback)
+        if ref not in values:
+            ref = fallback
+        title = mapping.get('title') or str(task.get('area') or '') + ' · ' + str(task.get('title') or '')
+        text = f"{title}: {task['progress']}% (in progress)."
+        if task.get('owner') == '함께':
+            text += ' Shared task.'
+        values[ref] = (values[ref] + '\n' + text).strip()
+    return values
 
 
-def weekly_copy_table(st, rows):
-    cell = 'border:1px solid #000;padding:6px 10px;font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;white-space:normal;vertical-align:middle;'
-    head = '<tr>' + ''.join('<th style="' + cell + 'background:#DEEAF6;text-align:center;font-weight:bold;">' + x + '</th>' for x in ['Category', 'Review / Plan']) + '</tr>'
-    content = ''.join('<tr><td style="' + cell + 'background:#fff;width:160px;">' + html.escape(r['category']) + '</td><td style="' + cell + 'background:#fff;">' + html.escape(r['summary']) + '</td></tr>' for r in rows)
-    table = lambda inner: '<table style="border-collapse:collapse;width:100%;table-layout:fixed;"><colgroup><col style="width:160px"><col></colgroup>' + inner + '</table>'
-    plain = '\n'.join(r['category'] + '\t' + r['summary'] for r in rows)
-    component = st.components.v2.component('weekly_customer_copy_v2', html='<div id="weekly-copy"></div>', js="""
-export default function(component) {
-  const {parentElement, data} = component;
-  const root = parentElement.querySelector('#weekly-copy');
-  root.innerHTML = '<div style="display:flex;gap:8px;margin:0 0 12px"><button id="body">내용 복사 · E:F</button><button id="all">헤더·서식 포함 복사</button><span role="status"></span></div>' + data.preview;
-  root.querySelectorAll('button').forEach(b => {b.style.cssText='padding:9px 14px;border:1px solid #7195bb;border-radius:6px;background:#235b92;color:white;cursor:pointer';});
-  for (const mode of ['body','all']) root.querySelector('#'+mode).onclick = async () => {
-    const plain = mode === 'all' ? 'Category\\tReview / Plan\\n'+data.plain : data.plain;
-    const rich = mode === 'all' ? data.preview : data.body;
-    const status = root.querySelector('[role=status]');
-    try {
-      await navigator.clipboard.write([new ClipboardItem({'text/plain':new Blob([plain],{type:'text/plain'}),'text/html':new Blob([rich],{type:'text/html'})})]);
-      status.textContent='복사했어요 · 시트 E열에 붙여넣기';
-    } catch (_) {
-      const handler = e => {e.clipboardData.setData('text/plain',plain);e.clipboardData.setData('text/html',rich);e.preventDefault();};
-      document.addEventListener('copy',handler);
-      const ok = document.execCommand('copy');
-      document.removeEventListener('copy',handler);
-      status.textContent=ok ? '복사했어요 · 시트 E열에 붙여넣기' : '복사가 차단됐어요. 아래 텍스트 복사를 이용해주세요.';
-    }
-  };
+def weekly_template_html(person, values):
+    template = WEEKLY_TEMPLATES[person]
+    total = sum(template['widths'])
+    cols = ''.join(f'<col style="width:{w / total * 100:.3f}%">' for w in template['widths'])
+    rendered = []
+    for row in template['rows']:
+        cells = []
+        for c in row:
+            value = values.get(c['ref'], '') if c['slot'] else c['text']
+            cells.append(f'<td rowspan="{c["span"][0]}" colspan="{c["span"][1]}" style="{c["css"]}">{html.escape(value)}</td>')
+        rendered.append('<tr>' + ''.join(cells) + '</tr>')
+    return '<table style="border-collapse:collapse;table-layout:fixed;width:100%;"><colgroup>' + cols + '</colgroup>' + ''.join(rendered) + '</table>'
+
+
+def weekly_template_copy(st, person, values):
+    import csv
+    import io
+    grid = [[''] * 5 for _ in WEEKLY_TEMPLATES[person]['rows']]
+    for row in WEEKLY_TEMPLATES[person]['rows']:
+        for c in row:
+            r, col = int(c['ref'][1:]) - 1, ord(c['ref'][0]) - ord('B')
+            grid[r][col] = values.get(c['ref'], '') if c['slot'] else c['text']
+    output = io.StringIO()
+    csv.writer(output, delimiter='\t', lineterminator='\n').writerows(grid)
+    component = st.components.v2.component('weekly_original_template_v3', html='<div id="weekly-template"></div>', js="""
+export default function({parentElement,data}) {
+ const root=parentElement.querySelector('#weekly-template');
+ root.innerHTML='<button style="background:#235b92;color:white;border:1px solid #7195bb;border-radius:6px;padding:10px 16px;cursor:pointer;margin-bottom:12px">원본 표 전체 복사 · 병합·서식 포함</button><span role="status" style="margin-left:12px"></span><div style="overflow-x:auto">'+data.html+'</div>';
+ root.querySelector('button').onclick=async()=>{
+  let ok=false;
+  try {await navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([data.html],{type:'text/html'}),'text/plain':new Blob([data.plain],{type:'text/plain'})})]);ok=true;}
+  catch (_) {const handler=e=>{e.clipboardData.setData('text/html',data.html);e.clipboardData.setData('text/plain',data.plain);e.preventDefault();};document.addEventListener('copy',handler);ok=document.execCommand('copy');document.removeEventListener('copy',handler);}
+  root.querySelector('[role=status]').textContent=ok?'복사했어요 · 해당 주차 표의 B열 첫 헤더 셀에 붙여넣기':'복사가 차단됐어요. 브라우저 복사 권한을 확인해주세요.';
+ };
 }
 """)
-    component(data=dict(preview=table(head + content), body=table(content), plain=plain), key='weekly_customer_table')
-    with st.expander('텍스트 복사 · 서식 없이 붙여넣기'):
-        st.code(plain, language=None, wrap_lines=True)
+    component(data=dict(html=weekly_template_html(person, values), plain=output.getvalue().rstrip('\n')), key='weekly_original_template')
 
 
 def weekly_render(st, body, actor, save):
@@ -275,9 +289,9 @@ def weekly_render(st, body, actor, save):
     key = week + ':' + person
     draft = body.get('weeklyDrafts', {}).get(key, {})
     st.subheader(f"{person} · Week of {date.fromisoformat(week).strftime('%m/%d')}–{friday}")
-    st.caption(f"이번 주 활동: {week}부터 7일 · 고객사별 1~2문장 · 뉴욕 기준")
-    if draft.get('formatVersion') != 2:
-        st.info('고객사별 짧은 초안 준비 중입니다. 기존 초안은 아래에 보관되어 있어요.')
+    st.caption(f"원본 {person} 탭의 분류·병합 셀·서식 유지 · 완료하지 않은 담당 업무의 진행률도 반영")
+    if draft.get('formatVersion') != 3:
+        st.info('원본 표 형식의 영어 초안을 준비하고 있습니다. 진행률은 바로 표시됩니다.')
     elif draft.get('fingerprint') != fingerprint:
         st.warning('새 기록이 있습니다. 아래 영어 초안은 아직 최신 기록을 모두 반영하지 않았어요.')
     else:
@@ -285,11 +299,8 @@ def weekly_render(st, body, actor, save):
     if draft:
         st.caption('초안 정리 시각: ' + draft.get('updatedAt', '') + ' · ' + draft.get('by', ''))
     st.markdown('#### 복사할 영어 초안')
-    st.caption('Weekly 시트의 해당 주차 E열 첫 내용 셀에 붙여넣으세요. 고객사는 E열, 요약은 F열에 들어갑니다. 헤더가 이미 있으면 ‘내용 복사’를 사용하세요.')
-    if draft.get('formatVersion') == 2 and draft.get('rows'):
-        weekly_copy_table(st, draft['rows'])
-    elif draft.get('formatVersion') == 2:
-        st.info('이번 주에 요약할 활동이 아직 없습니다.')
+    st.caption('해당 주차 표의 B열 첫 헤더 셀(이모지 칸)에 붙여넣으세요. 원본과 같은 분류·열·병합 구조로 복사됩니다. 진행률은 현재 담당 업무 기준이며, 100%도 완료 버튼을 누르기 전에는 진행 중으로 표시합니다.')
+    weekly_template_copy(st, person, weekly_template_values(person, draft, evidence))
     if draft.get('sections'):
         with st.expander('이전 6항목 초안 · 보관'):
             for label, text in draft['sections'].items():
@@ -314,13 +325,17 @@ def weekly_render(st, body, actor, save):
         with st.expander('이번 주 목표 · 담당 업무', expanded=False):
             for t in evidence['plans']:
                 st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress') or 0}% · 마감 {t.get('due') or '미정'} · 담당 {t.get('owner')}")
+        with st.expander('완료 전 진행률 · 담당 업무 전체'):
+            for t in evidence['progress']:
+                st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress')}% · 진행 중 · 담당 {t.get('owner')}")
         with st.expander('초안 작성용 원문 데이터'):
             st.code(json.dumps(evidence, ensure_ascii=False, indent=2), language='json')
             st.caption('근거 ID: ' + fingerprint)
     with st.expander('영어 초안 편집 / 저장'):
         with st.form('weekly_draft_' + key + '_' + fingerprint):
-            st.caption('한 줄에 고객사 → 탭 → 영어 요약. 고객사당 이번 주 활동 1~2문장만 작성하세요.')
-            edited = st.text_area('고객사별 영어 요약 · 탭으로 구분', value='\n'.join(r['category'] + '\t' + r['summary'] for r in draft.get('rows', [])), height=240)
+            st.caption('분류와 서식은 고정입니다. cells는 표 첫 헤더 행을 1행으로 센 내용 셀입니다. progressLabels는 업무 ID별 영어 이름과 표시 셀을 지정합니다. 진행률 숫자는 원본 업무에서 자동 반영됩니다.')
+            st.caption('내용 셀: ' + ', '.join(WEEKLY_TEMPLATES[person]['slots']))
+            edited = st.text_area('원본 표 내용 · JSON', value=json.dumps(dict(cells=draft.get('cells', {}), progressLabels=draft.get('progressLabels', {})), ensure_ascii=False, indent=2), height=300)
             if st.form_submit_button('영어 초안 저장'):
                 def update(latest):
                     _, actual = weekly_evidence(latest, person, week)
@@ -329,10 +344,16 @@ def weekly_render(st, body, actor, save):
                     current_draft = latest.get('weeklyDrafts', {}).get(key, {})
                     if current_draft != draft:
                         raise RuntimeError('다른 사람이 초안을 수정했어요. 새로고침 후 다시 저장해주세요.')
-                    latest.setdefault('weeklyDrafts', {})[key] = dict(current_draft, rows=parsed, formatVersion=2, fingerprint=fingerprint,
+                    latest.setdefault('weeklyDrafts', {})[key] = dict(current_draft, **parsed, formatVersion=3, fingerprint=fingerprint,
                         updatedAt=datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M'), by=actor)
                 try:
-                    parsed = weekly_parse_rows(edited)
+                    parsed = json.loads(edited)
+                    if not isinstance(parsed, dict) or set(parsed) != {'cells', 'progressLabels'}:
+                        raise ValueError('cells와 progressLabels를 입력해주세요.')
+                    if not isinstance(parsed['cells'], dict) or any(k not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v, str) for k, v in parsed['cells'].items()):
+                        raise ValueError('허용된 내용 셀과 텍스트만 입력해주세요.')
+                    if not isinstance(parsed['progressLabels'], dict) or any(not isinstance(v, dict) or v.get('cell') not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v.get('title'), str) for v in parsed['progressLabels'].values()):
+                        raise ValueError('진행률 업무의 영어 제목과 표시 셀을 확인해주세요.')
                     save(update, person + ' Weekly 영어 초안을 정리했어요')
                     st.rerun()
                 except (RuntimeError, ValueError) as exc:
