@@ -236,12 +236,55 @@ def weekly_template_values(person, draft, evidence):
     return values
 
 
-def weekly_template_html(person, values):
+def weekly_layout(person, values, categories=None):
+    original = copy.deepcopy(WEEKLY_TEMPLATES[person]['rows'])
+    if categories is None:
+        return original
+    lo, hi = (5, 17) if person == 'Hugo' else (3, 9)
+    keep = [r for r in range(1, len(original) + 1)
+            if not lo <= r <= hi or values.get('F' + str(r), '').strip()]
+    for r in range(1, len(original) + 1):
+        if r in keep:
+            continue
+        for c in original[r - 1]:
+            if c['span'][0] > 1 and not c['ref'].startswith('E'):
+                survivors = [k for k in keep if r <= k < r + c['span'][0]]
+                if survivors:
+                    moved = copy.deepcopy(c)
+                    moved['span'][0] -= survivors[0] - r
+                    moved['ref'] = c['ref'][0] + str(survivors[0])
+                    original[survivors[0] - 1].append(moved)
+    rows = []
+    category_css = next(c['css'] for row in original for c in row if c['ref'] == ('E13' if person == 'Hugo' else 'E4'))
+    for r in keep:
+        row = []
+        for c in original[r - 1]:
+            if lo <= r <= hi and c['ref'].startswith('E'):
+                continue
+            c['span'][0] = len([k for k in keep if r <= k < r + c['span'][0]])
+            row.append(c)
+        if lo <= r <= hi:
+            row.append(dict(ref='E' + str(r), text=categories.get('E' + str(r), ''), css=category_css, span=[1, 1], slot=False))
+        row.sort(key=lambda c: c['ref'][0])
+        rows.append(row)
+    # Merge repeated customer categories while retaining the original parent groups.
+    last = None
+    for row in rows:
+        category = next((c for c in row if c['ref'].startswith('E') and lo <= int(c['ref'][1:]) <= hi), None)
+        if category and category['text'] and last and last['text'] == category['text']:
+            last['span'][0] += 1
+            row.remove(category)
+        else:
+            last = category
+    return rows
+
+
+def weekly_template_html(person, values, categories=None):
     template = WEEKLY_TEMPLATES[person]
     total = sum(template['widths'])
     cols = ''.join(f'<col style="width:{w / total * 100:.3f}%">' for w in template['widths'])
     rendered = []
-    for row in template['rows']:
+    for row in weekly_layout(person, values, categories):
         cells = []
         for c in row:
             value = values.get(c['ref'], '') if c['slot'] else c['text']
@@ -250,13 +293,14 @@ def weekly_template_html(person, values):
     return '<table style="border-collapse:collapse;table-layout:fixed;width:100%;"><colgroup>' + cols + '</colgroup>' + ''.join(rendered) + '</table>'
 
 
-def weekly_template_copy(st, person, values):
+def weekly_template_copy(st, person, values, categories=None):
     import csv
     import io
-    grid = [[''] * 5 for _ in WEEKLY_TEMPLATES[person]['rows']]
-    for row in WEEKLY_TEMPLATES[person]['rows']:
+    layout = weekly_layout(person, values, categories)
+    grid = [[''] * 5 for _ in layout]
+    for r, row in enumerate(layout):
         for c in row:
-            r, col = int(c['ref'][1:]) - 1, ord(c['ref'][0]) - ord('B')
+            col = ord(c['ref'][0]) - ord('B')
             grid[r][col] = values.get(c['ref'], '') if c['slot'] else c['text']
     output = io.StringIO()
     csv.writer(output, delimiter='\t', lineterminator='\n').writerows(grid)
@@ -268,11 +312,11 @@ export default function({parentElement,data}) {
   let ok=false;
   try {await navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([data.html],{type:'text/html'}),'text/plain':new Blob([data.plain],{type:'text/plain'})})]);ok=true;}
   catch (_) {const handler=e=>{e.clipboardData.setData('text/html',data.html);e.clipboardData.setData('text/plain',data.plain);e.preventDefault();};document.addEventListener('copy',handler);ok=document.execCommand('copy');document.removeEventListener('copy',handler);}
-  root.querySelector('[role=status]').textContent=ok?'복사했어요 · 해당 주차 표의 B열 첫 헤더 셀에 붙여넣기':'복사가 차단됐어요. 브라우저 복사 권한을 확인해주세요.';
+  root.querySelector('[role=status]').textContent=ok?'복사했어요 · 시트의 빈 영역 B열에 붙여넣기':'복사가 차단됐어요. 브라우저 복사 권한을 확인해주세요.';
  };
 }
 """)
-    component(data=dict(html=weekly_template_html(person, values), plain=output.getvalue().rstrip('\n')), key='weekly_original_template')
+    component(data=dict(html=weekly_template_html(person, values, categories), plain=output.getvalue().rstrip('\n')), key='weekly_original_template')
 
 
 def weekly_render(st, body, actor, save):
@@ -289,8 +333,8 @@ def weekly_render(st, body, actor, save):
     key = week + ':' + person
     draft = body.get('weeklyDrafts', {}).get(key, {})
     st.subheader(f"{person} · Week of {date.fromisoformat(week).strftime('%m/%d')}–{friday}")
-    st.caption(f"원본 {person} 탭의 분류·병합 셀·서식 유지 · 완료하지 않은 담당 업무의 진행률도 반영")
-    if draft.get('formatVersion') != 3:
+    st.caption(f"{person} 원본 표의 큰 분류·서식 유지 · 세부 카테고리는 실제 업무에 맞춰 정리 · 미완료 진행률 포함")
+    if draft.get('formatVersion') != 4:
         st.info('원본 표 형식의 영어 초안을 준비하고 있습니다. 진행률은 바로 표시됩니다.')
     elif draft.get('fingerprint') != fingerprint:
         st.warning('새 기록이 있습니다. 아래 영어 초안은 아직 최신 기록을 모두 반영하지 않았어요.')
@@ -299,8 +343,8 @@ def weekly_render(st, body, actor, save):
     if draft:
         st.caption('초안 정리 시각: ' + draft.get('updatedAt', '') + ' · ' + draft.get('by', ''))
     st.markdown('#### 복사할 영어 초안')
-    st.caption('해당 주차 표의 B열 첫 헤더 셀(이모지 칸)에 붙여넣으세요. 원본과 같은 분류·열·병합 구조로 복사됩니다. 진행률은 현재 담당 업무 기준이며, 100%도 완료 버튼을 누르기 전에는 진행 중으로 표시합니다.')
-    weekly_template_copy(st, person, weekly_template_values(person, draft, evidence))
+    st.caption('원본 표 형식으로 복사됩니다. 세부 카테고리와 행 수는 이번 주 업무에 맞춰 정리되므로, 시트의 빈 영역 B열에 붙여넣으세요. 100%도 완료 버튼을 누르기 전에는 진행 중으로 표시합니다.')
+    weekly_template_copy(st, person, weekly_template_values(person, draft, evidence), draft.get('categories'))
     if draft.get('sections'):
         with st.expander('이전 6항목 초안 · 보관'):
             for label, text in draft['sections'].items():
@@ -333,9 +377,9 @@ def weekly_render(st, body, actor, save):
             st.caption('근거 ID: ' + fingerprint)
     with st.expander('영어 초안 편집 / 저장'):
         with st.form('weekly_draft_' + key + '_' + fingerprint):
-            st.caption('분류와 서식은 고정입니다. cells는 표 첫 헤더 행을 1행으로 센 내용 셀입니다. progressLabels는 업무 ID별 영어 이름과 표시 셀을 지정합니다. 진행률 숫자는 원본 업무에서 자동 반영됩니다.')
+            st.caption('큰 분류와 서식은 유지하고 세부 카테고리는 업무에 맞춰 조정합니다. 진행률 숫자는 원본 업무에서 자동 반영됩니다.')
             st.caption('내용 셀: ' + ', '.join(WEEKLY_TEMPLATES[person]['slots']))
-            edited = st.text_area('원본 표 내용 · JSON', value=json.dumps(dict(cells=draft.get('cells', {}), progressLabels=draft.get('progressLabels', {})), ensure_ascii=False, indent=2), height=300)
+            edited = st.text_area('원본 표 내용 · JSON', value=json.dumps(dict(cells=draft.get('cells', {}), categories=draft.get('categories', {}), progressLabels=draft.get('progressLabels', {})), ensure_ascii=False, indent=2), height=300)
             if st.form_submit_button('영어 초안 저장'):
                 def update(latest):
                     _, actual = weekly_evidence(latest, person, week)
@@ -344,12 +388,15 @@ def weekly_render(st, body, actor, save):
                     current_draft = latest.get('weeklyDrafts', {}).get(key, {})
                     if current_draft != draft:
                         raise RuntimeError('다른 사람이 초안을 수정했어요. 새로고침 후 다시 저장해주세요.')
-                    latest.setdefault('weeklyDrafts', {})[key] = dict(current_draft, **parsed, formatVersion=3, fingerprint=fingerprint,
+                    latest.setdefault('weeklyDrafts', {})[key] = dict(current_draft, **parsed, formatVersion=4, fingerprint=fingerprint,
                         updatedAt=datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M'), by=actor)
                 try:
                     parsed = json.loads(edited)
-                    if not isinstance(parsed, dict) or set(parsed) != {'cells', 'progressLabels'}:
-                        raise ValueError('cells와 progressLabels를 입력해주세요.')
+                    if not isinstance(parsed, dict) or set(parsed) != {'cells', 'categories', 'progressLabels'}:
+                        raise ValueError('cells, categories, progressLabels를 입력해주세요.')
+                    allowed_categories = ['E' + str(r) for r in (range(5, 18) if person == 'Hugo' else range(3, 10))]
+                    if not isinstance(parsed['categories'], dict) or any(k not in allowed_categories or not isinstance(v, str) for k, v in parsed['categories'].items()):
+                        raise ValueError('세부 카테고리 셀과 이름을 확인해주세요.')
                     if not isinstance(parsed['cells'], dict) or any(k not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v, str) for k, v in parsed['cells'].items()):
                         raise ValueError('허용된 내용 셀과 텍스트만 입력해주세요.')
                     if not isinstance(parsed['progressLabels'], dict) or any(not isinstance(v, dict) or v.get('cell') not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v.get('title'), str) for v in parsed['progressLabels'].values()):
