@@ -281,8 +281,9 @@ def weekly_layout(person, values, categories=None):
 
 def weekly_template_html(person, values, categories=None):
     template = WEEKLY_TEMPLATES[person]
-    total = sum(template['widths'])
-    cols = ''.join(f'<col style="width:{w / total * 100:.3f}%">' for w in template['widths'])
+    widths = ([6, 11, 22, 15, 46] if person == 'Hugo' else [8, 9, 10, 18, 55]) if categories is not None else template['widths']
+    total = sum(widths)
+    cols = ''.join(f'<col style="width:{w / total * 100:.3f}%">' for w in widths)
     rendered = []
     for row in weekly_layout(person, values, categories):
         cells = []
