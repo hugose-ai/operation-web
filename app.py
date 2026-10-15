@@ -95,6 +95,190 @@ def parse_order_workbook(blob, filename, source_url=""):
                 "sourceFile": filename, "sourceSheet": "Open SO Status", "sourceUrl": source_url,
                 "checkedAt": datetime.now(timezone.utc).isoformat(), "sourceRows": len(rows) - header[0]}
 
+"""Evidence-based weekly reporting; no external AI calls or workbook writes."""
+import copy
+import hashlib
+import json
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+WEEKLY_SECTIONS = ['Summary of Previous Week', 'Meaningful Accomplishments',
+                   'Biggest Roadblock(s)', 'This Weeks Goals', 'Final Deliverable', 'Final Notes']
+
+def weekly_person(value):
+    return 'Jayna' if value == '제이나' else value
+
+def weekly_day(value):
+    if not value:
+        return ''
+    try:
+        if len(value) == 10:
+            return date.fromisoformat(value).isoformat()
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(ZoneInfo('America/New_York')).date().isoformat()
+    except (ValueError, TypeError):
+        return ''
+
+def weekly_monday(value):
+    d = date.fromisoformat(value)
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+def weekly_snapshot(item):
+    keys = ['id', 'title', 'area', 'owner', 'status', 'progress', 'note', 'result',
+            'link', 'emailSubject', 'due', 'weekGoal', 'helpRequest', 'helpOffer']
+    return {k: copy.deepcopy(item.get(k)) for k in keys}
+
+def weekly_capture(old, new, actor, stamp=None):
+    stamp = stamp or datetime.now(timezone.utc).isoformat()
+    who = weekly_person(actor)
+    history = copy.deepcopy(old.get('weeklyActivity', []))
+    known = {x['id'] for x in history}
+    def add(kind, item, fields, at, author, text='', legacy=False):
+        if not weekly_day(at) or not author:
+            return
+        record = dict(kind=kind, task=weekly_snapshot(item), fields=fields, at=at,
+                      actor=weekly_person(author), text=text, legacy=legacy)
+        record['id'] = hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
+        if record['id'] not in known:
+            history.append(record)
+            known.add(record['id'])
+    # One-time conservative import: only dated, attributed facts, never inferred activity.
+    if not old.get('weeklyTrackingSince'):
+        for item in old.get('items', []):
+            if item.get('noteUpdatedBy'):
+                add('note', item, ['note', 'result', 'link', 'emailSubject'], item.get('noteUpdatedTime') or item.get('noteUpdatedAt'), item['noteUpdatedBy'], legacy=True)
+            if item.get('completedBy') and item.get('status') == 'complete':
+                add('completion', item, ['status'], item.get('completedTime'), item['completedBy'], legacy=True)
+            if item.get('progressUpdatedBy'):
+                add('progress', item, ['progress'], item.get('progressUpdatedAt'), item['progressUpdatedBy'], legacy=True)
+            for day, check in item.get('checks', {}).items():
+                for name, checked in check.get('people', {}).items():
+                    if checked:
+                        add('daily', item, ['checks'], day, name, legacy=True)
+    old_items = {x['id']: x for x in old.get('items', [])}
+    for item in new.get('items', []):
+        previous = old_items.get(item['id'], {})
+        fields = [k for k in weekly_snapshot(item) if item.get(k) != previous.get(k)]
+        if fields:
+            kind = 'completion' if item.get('status') == 'complete' and previous.get('status') != 'complete' else 'created' if not previous else 'update'
+            add(kind, item, fields, stamp, who)
+        for day, check in item.get('checks', {}).items():
+            prior = previous.get('checks', {}).get(day, {}).get('people', {})
+            for name, checked in check.get('people', {}).items():
+                if checked and not prior.get(name):
+                    add('daily', item, ['checks'], day, name)
+    new['weeklyActivity'] = history
+    new['weeklyTrackingSince'] = old.get('weeklyTrackingSince') or stamp
+    plans = copy.deepcopy(old.get('weeklyPlans', {}))
+    week = weekly_monday(weekly_day(stamp))
+    end = (date.fromisoformat(week) + timedelta(days=6)).isoformat()
+    plans[week] = [weekly_snapshot(x) for x in new.get('items', [])
+                   if x.get('status') == 'active' and not x.get('daily') and
+                   (x.get('weekGoal') == week or week <= (x.get('due') or '') <= end)]
+    new['weeklyPlans'] = plans
+
+def weekly_evidence(body, person, week):
+    start = date.fromisoformat(week)
+    previous = (start - timedelta(days=7)).isoformat()
+    end = (start + timedelta(days=7)).isoformat()
+    # Include available legacy evidence without mutating stored data.
+    view = copy.deepcopy(body)
+    if not body.get('weeklyTrackingSince'):
+        weekly_capture(body, view, person)
+    deleted = {x['id'] for x in body.get('items', []) if x.get('status') == 'deleted'}
+    records = [x for x in view.get('weeklyActivity', []) if x.get('actor') == person
+               and previous <= weekly_day(x.get('at')) < end and x.get('task', {}).get('id') not in deleted]
+    items = {x['id']: x for x in body.get('items', [])}
+    for c in body.get('comments', []):
+        if not c.get('deletedAt') and weekly_person(c.get('author')) == person and previous <= weekly_day(c.get('at')) < end:
+            task = items.get(c.get('taskId'), {})
+            records.append(dict(id=c['id'], kind='feedback', at=c['at'], actor=person,
+                                task={k: task.get(k) for k in ['id', 'title', 'area', 'owner']}, text=c.get('text', '')))
+    current = weekly_monday(datetime.now(ZoneInfo('America/New_York')).date().isoformat())
+    if week == current:
+        plans = [weekly_snapshot(x) for x in body.get('items', []) if x.get('status') == 'active' and not x.get('daily')
+                 and (x.get('weekGoal') == week or week <= (x.get('due') or '') < end)]
+    else:
+        plans = view.get('weeklyPlans', {}).get(week, [])
+    plans = [x for x in plans if weekly_person(x.get('owner')) == person or x.get('owner') == '함께']
+    evidence = dict(person=person, reportWeek=week, previousWeek=previous,
+                    activity=sorted(records, key=lambda x: x['at']), plans=plans,
+                    trackingSince=body.get('weeklyTrackingSince'),
+                    note='Activity is attributed to the actual editor; plans to the assigned owner. Shared tasks are not individual accomplishments. Legacy notes are latest available versions only. Do not infer earlier work, completion, or order-processing counts.')
+    fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
+    return evidence, fingerprint
+
+def weekly_render(st, body, actor, save):
+    st.header('Weekly · 주간 보고')
+    st.caption('기록은 주차별로 모이고, 영어 초안은 업무시간 중 매시간 정리됩니다. 원문을 확인한 뒤 복사하세요.')
+    if st.button('새 기록 불러오기', key='weekly_refresh'):
+        st.rerun()
+    c1, c2 = st.columns(2)
+    person = c1.selectbox('이름', ['Hugo', 'Jayna'], index=0 if weekly_person(actor) == 'Hugo' else 1)
+    picked = c2.date_input('보고 주차 · 해당 주의 날짜 선택', value=datetime.now(ZoneInfo('America/New_York')).date())
+    week = weekly_monday(picked.isoformat())
+    friday = (date.fromisoformat(week) + timedelta(days=4)).strftime('%m/%d')
+    evidence, fingerprint = weekly_evidence(body, person, week)
+    key = week + ':' + person
+    draft = body.get('weeklyDrafts', {}).get(key, {})
+    st.subheader(f"{person} · Week of {date.fromisoformat(week).strftime('%m/%d')}–{friday}")
+    st.caption(f"지난주 실적: {evidence['previousWeek']}부터 7일 / 이번 주 목표: {week}부터 7일 · 뉴욕 기준")
+    if not draft:
+        st.info('영어 초안 준비 중입니다. 오른쪽 원문 근거는 바로 확인할 수 있어요.')
+    elif draft.get('fingerprint') != fingerprint:
+        st.warning('새 기록이 있습니다. 아래 영어 초안은 아직 최신 기록을 모두 반영하지 않았어요.')
+    else:
+        st.success('현재 수집된 기록을 반영한 영어 초안입니다.')
+    if draft:
+        st.caption('초안 정리 시각: ' + draft.get('updatedAt', '') + ' · ' + draft.get('by', ''))
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown('#### 복사할 영어 초안')
+        sections = draft.get('sections', {})
+        for label in WEEKLY_SECTIONS:
+            st.markdown('**' + label + '**')
+            st.code(sections.get(label, 'Draft pending.'), language=None, wrap_lines=True)
+        full = '\n\n'.join(label + '\n' + sections.get(label, 'Draft pending.') for label in WEEKLY_SECTIONS)
+        with st.expander('전체 한 번에 복사'):
+            st.code(full, language=None, wrap_lines=True)
+    with right:
+        st.markdown('#### 원문 근거 · 작성자와 날짜')
+        st.caption('과거 기록이 부족한 주는 빈 부분이 생길 수 있습니다. 완료와 계획을 구분하며, 오더 건수는 자동 성과로 포함하지 않습니다.')
+        for label, lo, hi in [('지난주 기록', evidence['previousWeek'], week), ('이번 주 진행 기록', week, (date.fromisoformat(week)+timedelta(days=7)).isoformat())]:
+            with st.expander(label, expanded=True):
+                matched = [x for x in evidence['activity'] if lo <= weekly_day(x['at']) < hi]
+                if not matched:
+                    st.caption('날짜와 작성자가 확인되는 기록이 없습니다.')
+                for x in matched:
+                    t = x['task']
+                    st.markdown('**' + str(t.get('area') or '전체') + ' · ' + str(t.get('title') or '메모') + '**')
+                    st.caption(f"{x['actor']} · {x['at']} · {x['kind']}" + (' · 기존 최신 기록' if x.get('legacy') else ''))
+                    if x.get('text'):
+                        st.write(x['text'])
+                    for field in x.get('fields', []):
+                        if field in ['note','result','link','emailSubject','progress','status','due','helpRequest'] and t.get(field) is not None:
+                            st.write(f"{field}: {t[field]}")
+        with st.expander('이번 주 목표 · 담당 업무', expanded=True):
+            for t in evidence['plans']:
+                st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress') or 0}% · 마감 {t.get('due') or '미정'} · 담당 {t.get('owner')}")
+        with st.expander('초안 작성용 원문 데이터'):
+            st.code(json.dumps(evidence, ensure_ascii=False, indent=2), language='json')
+            st.caption('근거 ID: ' + fingerprint)
+    with st.expander('영어 초안 편집 / 저장'):
+        with st.form('weekly_draft_' + key + '_' + fingerprint):
+            edited = {label: st.text_area(label, value=draft.get('sections', {}).get(label, ''), height=120) for label in WEEKLY_SECTIONS}
+            if st.form_submit_button('영어 초안 저장'):
+                def update(latest):
+                    _, actual = weekly_evidence(latest, person, week)
+                    if actual != fingerprint:
+                        raise RuntimeError('새 업무 기록이 들어왔어요. 새로고침 후 최신 근거로 저장해주세요.')
+                    latest.setdefault('weeklyDrafts', {})[key] = dict(sections=edited, fingerprint=fingerprint,
+                        updatedAt=datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M'), by=actor)
+                try:
+                    save(update, person + ' Weekly 영어 초안을 정리했어요')
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
 
 HERE = Path(__file__).parent
 st.set_page_config(page_title="Operation", page_icon="📋", layout="wide")
@@ -114,6 +298,10 @@ KEY = setting("SUPABASE_PUBLISHABLE_KEY")
 
 
 def api(path, method="GET", payload=None, token=None):
+    if path == "/rest/v1/rpc/operation_save" and payload and token:
+        baseline = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)[0]
+        if baseline["revision"] == payload["p_expected_revision"]:
+            weekly_capture(baseline["body"], payload["p_body"], actor["display_name"])
     headers = {"apikey": KEY, "Content-Type": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -370,6 +558,16 @@ except (RuntimeError, urllib.error.URLError):
     st.error("공동 저장 서버에 연결하지 못했어요. 변경하지 않고 연결을 다시 확인해주세요.")
     if st.button("다시 연결"):
         st.rerun()
+    st.stop()
+
+with st.sidebar:
+    st.markdown("### 메뉴")
+    page = st.radio("화면", ["업무판", "Weekly · 주간 보고"], label_visibility="collapsed")
+if page == "Weekly · 주간 보고":
+    if not preview and not row["body"].get("weeklyTrackingSince"):
+        save_feedback_update(lambda body: None, "주차별 업무 기록 보관을 시작했어요")
+        st.rerun()
+    weekly_render(st, row["body"], actor["display_name"], save_feedback_update)
     st.stop()
 
 if not preview:
