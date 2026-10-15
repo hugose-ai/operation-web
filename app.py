@@ -292,22 +292,35 @@ def weekly_layout(person, values, categories=None):
     return rows
 
 
-def weekly_template_html(person, values, categories=None):
+def weekly_template_html(person, values, categories=None, feedback=None):
     template = WEEKLY_TEMPLATES[person]
     widths = ([6, 11, 22, 15, 46] if person == 'Hugo' else [8, 9, 10, 18, 55]) if categories is not None else template['widths']
+    if feedback is not None:
+        widths = list(widths) + [sum(widths) * .34]
     total = sum(widths)
     cols = ''.join(f'<col style="width:{w / total * 100:.3f}%">' for w in widths)
     rendered = []
-    for row in weekly_layout(person, values, categories):
+    for row_index, row in enumerate(weekly_layout(person, values, categories)):
         cells = []
         for c in row:
             value = values.get(c['ref'], '') if c['slot'] else c['text']
             cells.append(f'<td rowspan="{c["span"][0]}" colspan="{c["span"][1]}" style="{c["css"]}">{html.escape(value)}</td>')
+        if feedback is not None:
+            style = 'border:1px solid #222;background:#fff;color:#111;padding:6px;font:11pt Calibri,Arial,sans-serif;vertical-align:top;'
+            if row_index == 0:
+                cells.append('<th style="' + style + 'font-weight:bold;text-align:center;background:#eee;">Feedback</th>')
+            else:
+                ref = next((c['ref'] for c in row if c['slot']), None)
+                if ref:
+                    value = feedback.get(ref, '')
+                    cells.append('<td style="' + style + '"><textarea aria-label="Feedback ' + ref + '" data-feedback="' + ref + '" placeholder="수정하고 싶은 내용을 적어주세요" style="display:block;box-sizing:border-box;width:100%;min-height:64px;resize:vertical;border:0;outline:1px solid transparent;background:white;color:#111;font:11pt/1.4 Calibri,Arial,sans-serif;overflow:hidden;">' + html.escape(value) + '</textarea></td>')
+                else:
+                    cells.append('<td style="' + style + '"></td>')
         rendered.append('<tr>' + ''.join(cells) + '</tr>')
     return '<table style="border-collapse:collapse;table-layout:fixed;width:100%;"><colgroup>' + cols + '</colgroup>' + ''.join(rendered) + '</table>'
 
 
-def weekly_template_copy(st, person, values, categories=None):
+def weekly_template_copy(st, person, values, categories=None, feedback=None, feedback_key=''):
     import csv
     import io
     layout = weekly_layout(person, values, categories)
@@ -318,11 +331,19 @@ def weekly_template_copy(st, person, values, categories=None):
             grid[r][col] = values.get(c['ref'], '') if c['slot'] else c['text']
     output = io.StringIO()
     csv.writer(output, delimiter='\t', lineterminator='\n').writerows(grid)
-    component = st.components.v2.component('weekly_original_template_v3', html='<div id="weekly-template"></div>', js="""
-export default function({parentElement,data}) {
+    component = st.components.v2.component('weekly_original_template_feedback_v1', html='<div id="weekly-template"></div>', js="""
+export default function({parentElement,data,setTriggerValue}) {
  const root=parentElement.querySelector('#weekly-template');
- root.innerHTML='<button style="background:#235b92;color:white;border:1px solid #7195bb;border-radius:6px;padding:10px 16px;cursor:pointer;margin-bottom:12px">원본 표 전체 복사 · 병합·서식 포함</button><span role="status" style="margin-left:12px"></span><div style="overflow-x:auto">'+data.html+'</div>';
- root.querySelector('button').onclick=async()=>{
+ root.innerHTML='<button id="copy" style="background:#235b92;color:white;border:1px solid #7195bb;border-radius:6px;padding:10px 16px;cursor:pointer;margin-bottom:12px">원본 표 전체 복사 · 병합·서식 포함</button> <button id="save-feedback" style="background:#eee;color:#111;border:1px solid #555;border-radius:6px;padding:10px 16px;cursor:pointer">Feedback 저장</button><span role="status" style="margin-left:12px"></span><div style="overflow-x:auto">'+data.preview+'</div>';
+ const boxes=[...root.querySelectorAll('[data-feedback]')];
+ const resize=box=>{box.style.height='64px';box.style.height=Math.max(64,box.scrollHeight)+'px';};
+ boxes.forEach(box=>{resize(box);box.oninput=()=>{resize(box);root.querySelector('[role=status]').textContent='Feedback 변경됨 · 저장해주세요';};});
+ root.querySelector('#save-feedback').onclick=()=>{
+   const values=Object.fromEntries(boxes.map(box=>[box.dataset.feedback,box.value]));
+   setTriggerValue('feedbackSave',{id:crypto.randomUUID(),values,base:data.feedback});
+   root.querySelector('[role=status]').textContent='Feedback 저장 중…';
+ };
+ root.querySelector('#copy').onclick=async()=>{
   let ok=false;
   try {await navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([data.html],{type:'text/html'}),'text/plain':new Blob([data.plain],{type:'text/plain'})})]);ok=true;}
   catch (_) {const handler=e=>{e.clipboardData.setData('text/html',data.html);e.clipboardData.setData('text/plain',data.plain);e.preventDefault();};document.addEventListener('copy',handler);ok=document.execCommand('copy');document.removeEventListener('copy',handler);}
@@ -330,7 +351,7 @@ export default function({parentElement,data}) {
  };
 }
 """)
-    component(data=dict(html=weekly_template_html(person, values, categories), plain=output.getvalue().rstrip('\n')), key='weekly_original_template')
+    return component(data=dict(html=weekly_template_html(person, values, categories), preview=weekly_template_html(person, values, categories, feedback or {}), feedback=feedback or {}, plain=output.getvalue().rstrip('\n')), key='weekly_original_template_' + feedback_key, on_feedbackSave_change=lambda: None)
 
 
 def weekly_render(st, body, actor, save):
@@ -358,7 +379,32 @@ def weekly_render(st, body, actor, save):
         st.caption('초안 정리 시각: ' + draft.get('updatedAt', '') + ' · ' + draft.get('by', ''))
     st.markdown('#### 복사할 영어 초안')
     st.caption('원본 표 형식으로 복사됩니다. 세부 카테고리와 행 수는 이번 주 업무에 맞춰 정리되므로, 시트의 빈 영역 B열에 붙여넣으세요. 100%도 완료 버튼을 누르기 전에는 진행 중으로 표시합니다.')
-    weekly_template_copy(st, person, weekly_template_values(person, draft, evidence), draft.get('categories'))
+    st.caption('오른쪽 Feedback에 수정 요청을 적고 저장한 뒤 표를 스크린샷으로 전달하세요. 원본 표 복사에는 Feedback이 포함되지 않습니다.')
+    feedback = body.get('weeklyFeedback', {}).get(key, {})
+    feedback_result = weekly_template_copy(st, person, weekly_template_values(person, draft, evidence), draft.get('categories'), feedback, key)
+    feedback_change = feedback_result.get('feedbackSave')
+    if feedback_change and st.session_state.get('weekly_feedback_handled') != feedback_change.get('id'):
+        try:
+            values = feedback_change.get('values', {})
+            base = feedback_change.get('base', {})
+            if not isinstance(values, dict) or any(ref not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(text, str) or len(text) > 5000 for ref, text in values.items()):
+                raise ValueError('Feedback은 각 칸에 5,000자 이내로 입력해주세요.')
+            def update_feedback(latest):
+                target = latest.setdefault('weeklyFeedback', {}).setdefault(key, {})
+                for ref, text in values.items():
+                    if text == base.get(ref, ''):
+                        continue
+                    if target.get(ref, '') != base.get(ref, ''):
+                        raise RuntimeError('같은 Feedback을 다른 사람이 수정했어요. 새로고침 후 다시 확인해주세요.')
+                    target[ref] = text
+            save(update_feedback, person + ' Weekly Feedback을 저장했어요')
+            st.session_state.weekly_feedback_handled = feedback_change['id']
+            st.session_state.weekly_feedback_saved = key
+            st.rerun()
+        except (RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+    if st.session_state.get('weekly_feedback_saved') == key:
+        st.caption('Feedback을 저장했어요.')
     if draft.get('sections') and weekly_iottie_only(draft['sections']):
         with st.expander('이전 6항목 초안 · 보관'):
             for label, text in draft['sections'].items():
