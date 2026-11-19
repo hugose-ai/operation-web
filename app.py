@@ -1,1720 +1,5154 @@
-"""Operation: Streamlit UI with Supabase Auth and authenticated shared storage."""
-
-import json
-
-import os
-
-import time
-
-import uuid
-
-import hashlib
-
-from datetime import datetime, timezone
-
-from zoneinfo import ZoneInfo
-
-import urllib.error
-
-import urllib.request
-
-from pathlib import Path
-
-
-
-import streamlit as st
-
-# Read cached worksheet values without running workbook macros or formulas.
-
-import io
-
-import re
-
-import zipfile
-
-import posixpath
-
-from datetime import datetime, timedelta, timezone
-
-from xml.etree import ElementTree as ET
-
-
-
-
-
-def parse_order_workbook(blob, filename, source_url=""):
-
-    if len(blob) > 15 * 1024 * 1024:
-
-        raise ValueError("15MB 이하의 엑셀 파일을 선택해주세요.")
-
-    if not zipfile.is_zipfile(io.BytesIO(blob)):
-
-        raise ValueError("올바른 xlsx 또는 xlsm 파일이 아니에요.")
-
-    ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-
-    with zipfile.ZipFile(io.BytesIO(blob)) as z:
-
-        if sum(x.file_size for x in z.infolist()) > 100 * 1024 * 1024:
-
-            raise ValueError("엑셀 내부 데이터가 너무 큽니다.")
-
-        wb = ET.fromstring(z.read("xl/workbook.xml"))
-
-        sheet = next((s for s in wb.findall("s:sheets/s:sheet", ns)
-
-                      if s.attrib.get("name", "").strip().lower() == "open so status"), None)
-
-        if sheet is None:
-
-            raise ValueError("Open SO Status 시트를 찾지 못했어요.")
-
-        rid = sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
-
-        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
-
-        target = next(r.attrib["Target"] for r in rels if r.attrib["Id"] == rid)
-
-        path = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
-
-        strings = []
-
-        if "xl/sharedStrings.xml" in z.namelist():
-
-            strings = ["".join(si.itertext()) for si in ET.fromstring(z.read("xl/sharedStrings.xml"))]
-
-        rows = []
-
-        for row in ET.fromstring(z.read(path)).findall("s:sheetData/s:row", ns):
-
-            cells = {}
-
-            for c in row.findall("s:c", ns):
-
-                col = re.sub(r"\d", "", c.attrib["r"])
-
-                value = c.findtext("s:v", default="", namespaces=ns)
-
-                kind = c.attrib.get("t")
-
-                if kind == "s":
-
-                    value = strings[int(value)] if value else ""
-
-                elif kind == "inlineStr":
-
-                    value = "".join(c.find("s:is", ns).itertext())
-
-                cells[col] = value.strip()
-
-            rows.append((int(row.attrib["r"]), cells))
-
-        header = next(((n, r) for n, r in rows if r.get("C", "").upper() == "STATUS"
-
-                       and r.get("H", "").upper() == "CUSTOMER" and r.get("J", "").upper() == "ORDER VALUE"), None)
-
-        if not header:
-
-            raise ValueError("Status / Customer / Order Value 열 구성이 달라요. 기존 요약은 유지됩니다.")
-
-        props = wb.find("s:workbookPr", ns)
-
-        epoch = datetime(1904, 1, 1) if props is not None and props.attrib.get("date1904") in ("1", "true") else datetime(1899, 12, 30)
-
-        def date(value):
-
-            try:
-
-                return (epoch + timedelta(days=float(value))).date().isoformat() if value else ""
-
-            except (ValueError, OverflowError):
-
-                return value
-
-        orders, excluded, ids = [], {}, set()
-
-        for n, r in rows:
-
-            if n <= header[0] or not (r.get("B") or r.get("H") or r.get("I")):
-
-                continue
-
-            status = re.sub(r"\s+", " ", r.get("C", "").upper())
-
-            if status.startswith("#"):
-
-                raise ValueError(f"{n}행의 상태에 엑셀 오류가 있어요.")
-
-            if "SENT" in status or status in ("CANCELLED", "CANCELED"):
-
-                excluded[status] = excluded.get(status, 0) + 1
-
-                continue
-
-            if not status or not r.get("H"):
-
-                raise ValueError(f"{n}행에 상태 또는 회사명이 없어 집계하지 못했어요.")
-
-            key = (r.get("H"), r.get("B"), r.get("I"))
-
-            if key in ids:
-
-                raise ValueError(f"{n}행의 PO/SO가 중복돼요. 중복 여부를 확인해주세요.")
-
-            ids.add(key)
-
-            try:
-
-                amount = round(float(r["J"]), 2) if r.get("J") else None
-
-                if amount is not None and not (-1e12 < amount < 1e12):
-
-                    raise ValueError()
-
-            except ValueError:
-
-                raise ValueError(f"{n}행의 금액을 읽을 수 없어요.")
-
-            orders.append({"row": n, "status": status, "customer": r["H"],
-
-                           "po": r.get("B", ""), "so": r.get("I", ""), "amount": amount,
-
-                           "poDate": date(r.get("D", "")), "readyDate": date(r.get("E", "")),
-
-                           "shipFrom": r.get("G", ""), "note": r.get("O", "")})
-
-        return {"version": 1, "orders": orders, "excluded": excluded,
-
-                "sourceFile": filename, "sourceSheet": "Open SO Status", "sourceUrl": source_url,
-
-                "checkedAt": datetime.now(timezone.utc).isoformat(), "sourceRows": len(rows) - header[0]}
-
-
-
-# Evidence-based weekly reporting; no external AI calls or workbook writes.
-
-import copy
-
-import hashlib
-
-import json
-
-import html
-
-import re
-
-# Reference layout only; no source report contents.
-
-WEEKLY_TEMPLATES = {'Hugo': {'rows': [[{'ref': 'B1', 'text': '🫡', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'C1', 'text': 'Hugo', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'D1', 'text': 'Goal / Priority / Deliverable', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E1', 'text': 'Category', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F1', 'text': 'Review / Plan', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}], [{'ref': 'B2', 'text': 'Agenda', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [16, 1], 'slot': False}, {'ref': 'C2', 'text': '1. Previous Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [3, 1], 'slot': False}, {'ref': 'D2', 'text': 'Summary of Previous Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E2', 'text': 'US', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F2', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'D3', 'text': 'Meaningful Accomplishments', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E3', 'text': 'US', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'D4', 'text': 'Biggest Roadblock(s)', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E4', 'text': 'Amazon', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F4', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'C5', 'text': '2. This Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [13, 1], 'slot': False}, {'ref': 'D5', 'text': 'This Weeks Goals', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [13, 1], 'slot': False}, {'ref': 'E5', 'text': 'Line Review', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'F5', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F6', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F7', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F8', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F9', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F10', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F11', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E12', 'text': 'Excessive Units', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F12', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E13', 'text': 'Amazon', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F13', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E14', 'text': 'EU', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F14', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E15', 'text': 'Channel Setup', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;', 'span': [3, 1], 'slot': False}, {'ref': 'F15', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F16', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F17', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'B18', 'text': 'Additional Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 4], 'slot': False}, {'ref': 'F18', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}]], 'widths': [9.29, 10.86, 28.29, 9.43, 103.43], 'slots': ['F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17', 'F18'], 'sourceStart': 1156}, 'Jayna': {'rows': [[{'ref': 'B1', 'text': '🦋', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'C1', 'text': 'Jayna', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'D1', 'text': 'Goal / Priority / Deliverable', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'F1', 'text': 'Review / Plan', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}], [{'ref': 'B2', 'text': 'Previous Week Meeting Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'D2', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 3], 'slot': True}], [{'ref': 'B3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'C3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'D3', 'text': 'Ongoing', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'E3', 'text': 'Power Bank Compliance', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FCE5CD;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E4', 'text': 'EOT Series main image refresh', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F4', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E5', 'text': 'Amazon Andon Cord ', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F5', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E6', 'text': 'BBY MP / Macys MP', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F6', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E7', 'text': 'AAFES', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F7', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E8', 'text': 'TikTok', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F8', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E9', 'text': 'NL Shipment Status', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#EAD1DC;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F9', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'B10', 'text': 'Final Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'D10', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 3], 'slot': True}]], 'widths': [15.0, 17.57, 15.86, 28.57, 120.57], 'slots': ['D2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'D10'], 'sourceStart': 522}}
-
-
-
-from datetime import date, datetime, timedelta, timezone
-
-from zoneinfo import ZoneInfo
-
-
-
-WEEKLY_SECTIONS = ['Summary of Previous Week', 'Meaningful Accomplishments',
-
-                   'Biggest Roadblock(s)', 'This Weeks Goals', 'Final Deliverable', 'Final Notes']
-
-
-
-def weekly_person(value):
-
-    return 'Jayna' if value == '제이나' else value
-
-
-
-def weekly_day(value):
-
-    if not value:
-
-        return ''
-
-    try:
-
-        if len(value) == 10:
-
-            return date.fromisoformat(value).isoformat()
-
-        return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(ZoneInfo('America/New_York')).date().isoformat()
-
-    except (ValueError, TypeError):
-
-        return ''
-
-
-
-def weekly_monday(value):
-
-    d = date.fromisoformat(value)
-
-    return (d - timedelta(days=d.weekday())).isoformat()
-
-
-
-def weekly_snapshot(item):
-
-    keys = ['id', 'title', 'area', 'owner', 'status', 'progress', 'note', 'result',
-
-            'link', 'emailSubject', 'due', 'weekGoal', 'helpRequest', 'helpOffer']
-
-    return {k: copy.deepcopy(item.get(k)) for k in keys}
-
-
-
-def weekly_capture(old, new, actor, stamp=None):
-
-    stamp = stamp or datetime.now(timezone.utc).isoformat()
-
-    who = weekly_person(actor)
-
-    history = copy.deepcopy(old.get('weeklyActivity', []))
-
-    known = {x['id'] for x in history}
-
-    def add(kind, item, fields, at, author, text='', legacy=False):
-
-        if not weekly_day(at) or not author:
-
-            return
-
-        record = dict(kind=kind, task=weekly_snapshot(item), fields=fields, at=at,
-
-                      actor=weekly_person(author), text=text, legacy=legacy)
-
-        record['id'] = hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
-
-        if record['id'] not in known:
-
-            history.append(record)
-
-            known.add(record['id'])
-
-    # One-time conservative import: only dated, attributed facts, never inferred activity.
-
-    if not old.get('weeklyTrackingSince'):
-
-        for item in old.get('items', []):
-
-            if item.get('noteUpdatedBy'):
-
-                add('note', item, ['note', 'result', 'link', 'emailSubject'], item.get('noteUpdatedTime') or item.get('noteUpdatedAt'), item['noteUpdatedBy'], legacy=True)
-
-            if item.get('completedBy') and item.get('status') == 'complete':
-
-                add('completion', item, ['status'], item.get('completedTime'), item['completedBy'], legacy=True)
-
-            if item.get('progressUpdatedBy'):
-
-                add('progress', item, ['progress'], item.get('progressUpdatedAt'), item['progressUpdatedBy'], legacy=True)
-
-            for day, check in item.get('checks', {}).items():
-
-                for name, checked in check.get('people', {}).items():
-
-                    if checked:
-
-                        add('daily', item, ['checks'], day, name, legacy=True)
-
-    old_items = {x['id']: x for x in old.get('items', [])}
-
-    for item in new.get('items', []):
-
-        previous = old_items.get(item['id'], {})
-
-        fields = [k for k in weekly_snapshot(item) if item.get(k) != previous.get(k)]
-
-        if fields:
-
-            kind = 'completion' if item.get('status') == 'complete' and previous.get('status') != 'complete' else 'created' if not previous else 'update'
-
-            add(kind, item, fields, stamp, who)
-
-        for day, check in item.get('checks', {}).items():
-
-            prior = previous.get('checks', {}).get(day, {}).get('people', {})
-
-            for name, checked in check.get('people', {}).items():
-
-                if checked and not prior.get(name):
-
-                    add('daily', item, ['checks'], day, name)
-
-    new['weeklyActivity'] = history
-
-    new['weeklyTrackingSince'] = old.get('weeklyTrackingSince') or stamp
-
-    plans = copy.deepcopy(old.get('weeklyPlans', {}))
-
-    week = weekly_monday(weekly_day(stamp))
-
-    end = (date.fromisoformat(week) + timedelta(days=6)).isoformat()
-
-    plans[week] = [weekly_snapshot(x) for x in new.get('items', [])
-
-                   if x.get('status') == 'active' and not x.get('daily') and
-
-                   (x.get('weekGoal') == week or week <= (x.get('due') or '') <= end)]
-
-    new['weeklyPlans'] = plans
-
-    progress = copy.deepcopy(old.get('weeklyProgress', {}))
-
-    progress[week] = [weekly_snapshot(x) for x in new.get('items', [])
-
-                      if x.get('status') == 'active' and not x.get('daily') and x.get('progress', 0)]
-
-    new['weeklyProgress'] = progress
-
-
-
-def weekly_iottie_only(value):
-
-    text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-
-    return not re.search(r'shoppe|shopee|duo[\s_-]*green|듀오\s*그린|쇼피|쇼페', text, re.IGNORECASE)
-
-
-
-
-
-def weekly_evidence(body, person, week):
-
-    start = date.fromisoformat(week)
-
-    previous = (start - timedelta(days=7)).isoformat()
-
-    end = (start + timedelta(days=7)).isoformat()
-
-    # Include available legacy evidence without mutating stored data.
-
-    view = copy.deepcopy(body)
-
-    if not body.get('weeklyTrackingSince'):
-
-        weekly_capture(body, view, person)
-
-    deleted = {x['id'] for x in body.get('items', []) if x.get('status') == 'deleted'}
-
-    records = [x for x in view.get('weeklyActivity', []) if x.get('actor') == person
-
-               and previous <= weekly_day(x.get('at')) < end and x.get('task', {}).get('id') not in deleted]
-
-    items = {x['id']: x for x in body.get('items', [])}
-
-    for c in body.get('comments', []):
-
-        if not c.get('deletedAt') and weekly_person(c.get('author')) == person and previous <= weekly_day(c.get('at')) < end:
-
-            task = items.get(c.get('taskId'), {})
-
-            records.append(dict(id=c['id'], kind='feedback', at=c['at'], actor=person,
-
-                                task={k: task.get(k) for k in ['id', 'title', 'area', 'owner']}, text=c.get('text', '')))
-
-    current = weekly_monday(datetime.now(ZoneInfo('America/New_York')).date().isoformat())
-
-    if week == current:
-
-        plans = [weekly_snapshot(x) for x in body.get('items', []) if x.get('status') == 'active' and not x.get('daily')
-
-                 and (x.get('weekGoal') == week or week <= (x.get('due') or '') < end)]
-
-    else:
-
-        plans = view.get('weeklyPlans', {}).get(week, [])
-
-    plans = [x for x in plans if weekly_person(x.get('owner')) == person or x.get('owner') == '함께']
-
-    progress = ([weekly_snapshot(x) for x in body.get('items', [])
-
-                 if x.get('status') == 'active' and not x.get('daily') and x.get('progress', 0)]
-
-                if week == current else body.get('weeklyProgress', {}).get(week, []))
-
-    progress = [x for x in progress if weekly_person(x.get('owner')) == person or x.get('owner') == '함께']
-
-    excluded_ids = {x['id'] for x in body.get('items', []) if not weekly_iottie_only(x)}
-
-    records = [x for x in records if x.get('task', {}).get('id') not in excluded_ids and weekly_iottie_only(x)]
-
-    plans = [x for x in plans if x.get('id') not in excluded_ids and weekly_iottie_only(x)]
-
-    progress = [x for x in progress if x.get('id') not in excluded_ids and weekly_iottie_only(x)]
-
-    evidence = dict(person=person, reportWeek=week, previousWeek=previous, scope='iOttie only; exclude Shoppe/Shopee and all DuoGreen work',
-
-                    activity=sorted(records, key=lambda x: x['at']), plans=plans, progress=progress,
-
-                    trackingSince=body.get('weeklyTrackingSince'),
-
-                    note='Activity is attributed to the actual editor; plans to the assigned owner. Shared tasks are not individual accomplishments. Legacy notes are latest available versions only. Do not infer earlier work, completion, or order-processing counts.')
-
-    fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
-
-    return evidence, fingerprint
-
-
-
-def weekly_template_values(person, draft, evidence):
-
-    template = WEEKLY_TEMPLATES[person]
-
-    values = {ref: '\n'.join(line for line in draft.get('cells', {}).get(ref, '').splitlines() if weekly_iottie_only(line)) for ref in template['slots']}
-
-    for ref in values:
-
-        if not weekly_iottie_only(draft.get('categories', {}).get('E' + ref[1:], '')):
-
-            values[ref] = ''
-
-    fallback = 'F18' if person == 'Hugo' else 'D10'
-
-    for task in evidence.get('progress', []):
-
-        mapping = draft.get('progressLabels', {}).get(task['id'], {})
-
-        ref = mapping.get('cell', fallback)
-
-        if ref not in values:
-
-            ref = fallback
-
-        title = mapping.get('title') or str(task.get('area') or '') + ' · ' + str(task.get('title') or '')
-
-        text = f"{title}: {task['progress']}% (in progress)."
-
-        if task.get('owner') == '함께':
-
-            text += ' Shared task.'
-
-        values[ref] = (values[ref] + '\n' + text).strip()
-
-    return values
-
-
-
-
-
-def weekly_layout(person, values, categories=None):
-
-    original = copy.deepcopy(WEEKLY_TEMPLATES[person]['rows'])
-
-    if categories is None:
-
-        return original
-
-    lo, hi = (5, 17) if person == 'Hugo' else (3, 9)
-
-    keep = [r for r in range(1, len(original) + 1)
-
-            if not lo <= r <= hi or values.get('F' + str(r), '').strip()]
-
-    for r in range(1, len(original) + 1):
-
-        if r in keep:
-
-            continue
-
-        for c in original[r - 1]:
-
-            if c['span'][0] > 1 and not c['ref'].startswith('E'):
-
-                survivors = [k for k in keep if r <= k < r + c['span'][0]]
-
-                if survivors:
-
-                    moved = copy.deepcopy(c)
-
-                    moved['span'][0] -= survivors[0] - r
-
-                    moved['ref'] = c['ref'][0] + str(survivors[0])
-
-                    original[survivors[0] - 1].append(moved)
-
-    rows = []
-
-    category_css = next(c['css'] for row in original for c in row if c['ref'] == ('E13' if person == 'Hugo' else 'E4'))
-
-    for r in keep:
-
-        row = []
-
-        for c in original[r - 1]:
-
-            if lo <= r <= hi and c['ref'].startswith('E'):
-
-                continue
-
-            c['span'][0] = len([k for k in keep if r <= k < r + c['span'][0]])
-
-            row.append(c)
-
-        if lo <= r <= hi:
-
-            row.append(dict(ref='E' + str(r), text=categories.get('E' + str(r), ''), css=category_css, span=[1, 1], slot=False))
-
-        row.sort(key=lambda c: c['ref'][0])
-
-        rows.append(row)
-
-    # Merge repeated customer categories while retaining the original parent groups.
-
-    last = None
-
-    for row in rows:
-
-        category = next((c for c in row if c['ref'].startswith('E') and lo <= int(c['ref'][1:]) <= hi), None)
-
-        if category and category['text'] and last and last['text'] == category['text']:
-
-            last['span'][0] += 1
-
-            row.remove(category)
-
-        else:
-
-            last = category
-
-    return rows
-
-
-
-
-
-def weekly_template_html(person, values, categories=None, feedback=None):
-
-    template = WEEKLY_TEMPLATES[person]
-
-    widths = ([6, 11, 22, 15, 46] if person == 'Hugo' else [8, 9, 10, 18, 55]) if categories is not None else template['widths']
-
-    if feedback is not None:
-
-        widths = list(widths) + [sum(widths) * .34]
-
-    total = sum(widths)
-
-    cols = ''.join(f'<col style="width:{w / total * 100:.3f}%">' for w in widths)
-
-    rendered = []
-
-    for row_index, row in enumerate(weekly_layout(person, values, categories)):
-
-        cells = []
-
-        for c in row:
-
-            value = values.get(c['ref'], '') if c['slot'] else c['text']
-
-            cells.append(f'<td rowspan="{c["span"][0]}" colspan="{c["span"][1]}" style="{c["css"]}">{html.escape(value)}</td>')
-
-        if feedback is not None:
-
-            style = 'border:1px solid #222;background:#fff;color:#111;padding:6px;font:11pt Calibri,Arial,sans-serif;vertical-align:top;'
-
-            if row_index == 0:
-
-                cells.append('<th style="' + style + 'font-weight:bold;text-align:center;background:#eee;">Feedback</th>')
-
-            else:
-
-                ref = next((c['ref'] for c in row if c['slot']), None)
-
-                if ref:
-
-                    value = feedback.get(ref, '')
-
-                    cells.append('<td style="' + style + '"><textarea aria-label="Feedback ' + ref + '" data-feedback="' + ref + '" placeholder="수정하고 싶은 내용을 적어주세요" style="display:block;box-sizing:border-box;width:100%;min-height:64px;resize:vertical;border:0;outline:1px solid transparent;background:white;color:#111;font:11pt/1.4 Calibri,Arial,sans-serif;overflow:hidden;">' + html.escape(value) + '</textarea></td>')
-
-                else:
-
-                    cells.append('<td style="' + style + '"></td>')
-
-        rendered.append('<tr>' + ''.join(cells) + '</tr>')
-
-    return '<table style="border-collapse:collapse;table-layout:fixed;width:100%;"><colgroup>' + cols + '</colgroup>' + ''.join(rendered) + '</table>'
-
-
-
-
-
-def weekly_template_copy(st, person, values, categories=None, feedback=None, feedback_key=''):
-
-    import csv
-
-    import io
-
-    layout = weekly_layout(person, values, categories)
-
-    grid = [[''] * 5 for _ in layout]
-
-    for r, row in enumerate(layout):
-
-        for c in row:
-
-            col = ord(c['ref'][0]) - ord('B')
-
-            grid[r][col] = values.get(c['ref'], '') if c['slot'] else c['text']
-
-    output = io.StringIO()
-
-    csv.writer(output, delimiter='\t', lineterminator='\n').writerows(grid)
-
-    component = st.components.v2.component('weekly_original_template_feedback_v1', html='<div id="weekly-template"></div>', js="""
-
-export default function({parentElement,data,setTriggerValue}) {
-
- const root=parentElement.querySelector('#weekly-template');
-
- root.innerHTML='<button id="copy" style="background:#235b92;color:white;border:1px solid #7195bb;border-radius:6px;padding:10px 16px;cursor:pointer;margin-bottom:12px">원본 표 전체 복사 · 병합·서식 포함</button> <button id="save-feedback" style="background:#eee;color:#111;border:1px solid #555;border-radius:6px;padding:10px 16px;cursor:pointer">Feedback 저장</button><span role="status" style="margin-left:12px"></span><div style="overflow-x:auto">'+data.preview+'</div>';
-
- const boxes=[...root.querySelectorAll('[data-feedback]')];
-
- const resize=box=>{box.style.height='64px';box.style.height=Math.max(64,box.scrollHeight)+'px';};
-
- boxes.forEach(box=>{resize(box);box.oninput=()=>{resize(box);root.querySelector('[role=status]').textContent='Feedback 변경됨 · 저장해주세요';};});
-
- root.querySelector('#save-feedback').onclick=()=>{
-
-   const values=Object.fromEntries(boxes.map(box=>[box.dataset.feedback,box.value]));
-
-   setTriggerValue('feedbackSave',{id:crypto.randomUUID(),values,base:data.feedback});
-
-   root.querySelector('[role=status]').textContent='Feedback 저장 중…';
-
- };
-
- root.querySelector('#copy').onclick=async()=>{
-
-  let ok=false;
-
-  try {await navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([data.html],{type:'text/html'}),'text/plain':new Blob([data.plain],{type:'text/plain'})})]);ok=true;}
-
-  catch (_) {const handler=e=>{e.clipboardData.setData('text/html',data.html);e.clipboardData.setData('text/plain',data.plain);e.preventDefault();};document.addEventListener('copy',handler);ok=document.execCommand('copy');document.removeEventListener('copy',handler);}
-
-  root.querySelector('[role=status]').textContent=ok?'복사했어요 · 시트의 빈 영역 B열에 붙여넣기':'복사가 차단됐어요. 브라우저 복사 권한을 확인해주세요.';
-
- };
-
-}
-
-""")
-
-    return component(data=dict(html=weekly_template_html(person, values, categories), preview=weekly_template_html(person, values, categories, feedback or {}), feedback=feedback or {}, plain=output.getvalue().rstrip('\n')), key='weekly_original_template_' + feedback_key, on_feedbackSave_change=lambda: None)
-
-
-
-
-
-def weekly_render(st, body, actor, save):
-
-    st.header('Weekly · 주간 보고')
-
-    st.caption('기록은 주차별로 모이고, 영어 초안은 업무시간 중 매시간 정리됩니다. 원문을 확인한 뒤 복사하세요.')
-
-    if st.button('새 기록 불러오기', key='weekly_refresh'):
-
-        st.rerun()
-
-    c1, c2 = st.columns(2)
-
-    person = c1.selectbox('이름', ['Hugo', 'Jayna'], index=0 if weekly_person(actor) == 'Hugo' else 1)
-
-    picked = c2.date_input('보고 주차 · 해당 주의 날짜 선택', value=datetime.now(ZoneInfo('America/New_York')).date())
-
-    week = weekly_monday(picked.isoformat())
-
-    friday = (date.fromisoformat(week) + timedelta(days=4)).strftime('%m/%d')
-
-    evidence, fingerprint = weekly_evidence(body, person, week)
-
-    key = week + ':' + person
-
-    draft = body.get('weeklyDrafts', {}).get(key, {})
-
-    st.subheader(f"{person} · Week of {date.fromisoformat(week).strftime('%m/%d')}–{friday}")
-
-    st.caption(f"{person} 원본 표의 큰 분류·서식 유지 · 세부 카테고리는 실제 업무에 맞춰 정리 · 미완료 진행률 포함")
-
-    if draft.get('formatVersion') != 4:
-
-        st.info('원본 표 형식의 영어 초안을 준비하고 있습니다. 진행률은 바로 표시됩니다.')
-
-    elif draft.get('fingerprint') != fingerprint:
-
-        st.warning('새 기록이 있습니다. 아래 영어 초안은 아직 최신 기록을 모두 반영하지 않았어요.')
-
-    else:
-
-        st.success('현재 수집된 기록을 반영한 영어 초안입니다.')
-
-    if draft:
-
-        st.caption('초안 정리 시각: ' + draft.get('updatedAt', '') + ' · ' + draft.get('by', ''))
-
-    st.markdown('#### 복사할 영어 초안')
-
-    st.caption('원본 표 형식으로 복사됩니다. 세부 카테고리와 행 수는 이번 주 업무에 맞춰 정리되므로, 시트의 빈 영역 B열에 붙여넣으세요. 100%도 완료 버튼을 누르기 전에는 진행 중으로 표시합니다.')
-
-    st.caption('오른쪽 Feedback에 수정 요청을 적고 저장한 뒤 표를 스크린샷으로 전달하세요. 원본 표 복사에는 Feedback이 포함되지 않습니다.')
-
-    feedback = body.get('weeklyFeedback', {}).get(key, {})
-
-    feedback_result = weekly_template_copy(st, person, weekly_template_values(person, draft, evidence), draft.get('categories'), feedback, key)
-
-    feedback_change = feedback_result.get('feedbackSave')
-
-    if feedback_change and st.session_state.get('weekly_feedback_handled') != feedback_change.get('id'):
-
-        try:
-
-            values = feedback_change.get('values', {})
-
-            base = feedback_change.get('base', {})
-
-            if not isinstance(values, dict) or any(ref not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(text, str) or len(text) > 5000 for ref, text in values.items()):
-
-                raise ValueError('Feedback은 각 칸에 5,000자 이내로 입력해주세요.')
-
-            def update_feedback(latest):
-
-                target = latest.setdefault('weeklyFeedback', {}).setdefault(key, {})
-
-                for ref, text in values.items():
-
-                    if text == base.get(ref, ''):
-
-                        continue
-
-                    if target.get(ref, '') != base.get(ref, ''):
-
-                        raise RuntimeError('같은 Feedback을 다른 사람이 수정했어요. 새로고침 후 다시 확인해주세요.')
-
-                    target[ref] = text
-
-            save(update_feedback, person + ' Weekly Feedback을 저장했어요')
-
-            st.session_state.weekly_feedback_handled = feedback_change['id']
-
-            st.session_state.weekly_feedback_saved = key
-
-            st.rerun()
-
-        except (RuntimeError, ValueError) as exc:
-
-            st.error(str(exc))
-
-    if st.session_state.get('weekly_feedback_saved') == key:
-
-        st.caption('Feedback을 저장했어요.')
-
-    if draft.get('sections') and weekly_iottie_only(draft['sections']):
-
-        with st.expander('이전 6항목 초안 · 보관'):
-
-            for label, text in draft['sections'].items():
-
-                st.markdown('**' + label + '**')
-
-                st.write(text)
-
-    with st.expander('원문 근거 · 작성자와 날짜'):
-
-        st.caption('과거 기록이 부족한 주는 빈 부분이 생길 수 있습니다. 완료와 계획을 구분하며, 오더 건수는 자동 성과로 포함하지 않습니다.')
-
-        for label, lo, hi in [('지난주 기록', evidence['previousWeek'], week), ('이번 주 진행 기록', week, (date.fromisoformat(week)+timedelta(days=7)).isoformat())]:
-
-            with st.expander(label, expanded=False):
-
-                matched = [x for x in evidence['activity'] if lo <= weekly_day(x['at']) < hi]
-
-                if not matched:
-
-                    st.caption('날짜와 작성자가 확인되는 기록이 없습니다.')
-
-                for x in matched:
-
-                    t = x['task']
-
-                    st.markdown('**' + str(t.get('area') or '전체') + ' · ' + str(t.get('title') or '메모') + '**')
-
-                    st.caption(f"{x['actor']} · {x['at']} · {x['kind']}" + (' · 기존 최신 기록' if x.get('legacy') else ''))
-
-                    if x.get('text'):
-
-                        st.write(x['text'])
-
-                    for field in x.get('fields', []):
-
-                        if field in ['note','result','link','emailSubject','progress','status','due','helpRequest'] and t.get(field) is not None:
-
-                            st.write(f"{field}: {t[field]}")
-
-        with st.expander('이번 주 목표 · 담당 업무', expanded=False):
-
-            for t in evidence['plans']:
-
-                st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress') or 0}% · 마감 {t.get('due') or '미정'} · 담당 {t.get('owner')}")
-
-        with st.expander('완료 전 진행률 · 담당 업무 전체'):
-
-            for t in evidence['progress']:
-
-                st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress')}% · 진행 중 · 담당 {t.get('owner')}")
-
-        with st.expander('초안 작성용 원문 데이터'):
-
-            st.code(json.dumps(evidence, ensure_ascii=False, indent=2), language='json')
-
-            st.caption('근거 ID: ' + fingerprint)
-
-    with st.expander('영어 초안 편집 / 저장'):
-
-        with st.form('weekly_draft_' + key + '_' + fingerprint):
-
-            st.caption('큰 분류와 서식은 유지하고 세부 카테고리는 업무에 맞춰 조정합니다. 진행률 숫자는 원본 업무에서 자동 반영됩니다.')
-
-            st.caption('내용 셀: ' + ', '.join(WEEKLY_TEMPLATES[person]['slots']))
-
-            edited = st.text_area('원본 표 내용 · JSON', value=json.dumps(dict(cells=draft.get('cells', {}), categories=draft.get('categories', {}), progressLabels=draft.get('progressLabels', {})), ensure_ascii=False, indent=2), height=300)
-
-            if st.form_submit_button('영어 초안 저장'):
-
-                def update(latest):
-
-                    _, actual = weekly_evidence(latest, person, week)
-
-                    if actual != fingerprint:
-
-                        raise RuntimeError('새 업무 기록이 들어왔어요. 새로고침 후 최신 근거로 저장해주세요.')
-
-                    current_draft = latest.get('weeklyDrafts', {}).get(key, {})
-
-                    if current_draft != draft:
-
-                        raise RuntimeError('다른 사람이 초안을 수정했어요. 새로고침 후 다시 저장해주세요.')
-
-                    latest.setdefault('weeklyDrafts', {})[key] = dict(current_draft, **parsed, formatVersion=4, fingerprint=fingerprint,
-
-                        updatedAt=datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M'), by=actor)
-
-                try:
-
-                    parsed = json.loads(edited)
-
-                    if not isinstance(parsed, dict) or set(parsed) != {'cells', 'categories', 'progressLabels'}:
-
-                        raise ValueError('cells, categories, progressLabels를 입력해주세요.')
-
-                    allowed_categories = ['E' + str(r) for r in (range(5, 18) if person == 'Hugo' else range(3, 10))]
-
-                    if not isinstance(parsed['categories'], dict) or any(k not in allowed_categories or not isinstance(v, str) for k, v in parsed['categories'].items()):
-
-                        raise ValueError('세부 카테고리 셀과 이름을 확인해주세요.')
-
-                    if not isinstance(parsed['cells'], dict) or any(k not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v, str) for k, v in parsed['cells'].items()):
-
-                        raise ValueError('허용된 내용 셀과 텍스트만 입력해주세요.')
-
-                    if not isinstance(parsed['progressLabels'], dict) or any(not isinstance(v, dict) or v.get('cell') not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v.get('title'), str) for v in parsed['progressLabels'].values()):
-
-                        raise ValueError('진행률 업무의 영어 제목과 표시 셀을 확인해주세요.')
-
-                    save(update, person + ' Weekly 영어 초안을 정리했어요')
-
-                    st.rerun()
-
-                except (RuntimeError, ValueError) as exc:
-
-                    st.error(str(exc))
-
-
-
-
-
-HERE = Path(__file__).parent
-
-st.set_page_config(page_title="Operation", page_icon="📋", layout="wide")
-
-
-
-
-
-def setting(name, default=""):
-
-    if os.environ.get(name):
-
-        return os.environ[name]
-
-    try:
-
-        return st.secrets.get(name, default)
-
-    except Exception:
-
-        return default
-
-
-
-
-
-URL = setting("SUPABASE_URL").rstrip("/")
-
-KEY = setting("SUPABASE_PUBLISHABLE_KEY")
-
-
-
-
-
-def api(path, method="GET", payload=None, token=None):
-
-    if path == "/rest/v1/rpc/operation_save" and payload and token:
-
-        baseline = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)[0]
-
-        if baseline["revision"] == payload["p_expected_revision"]:
-
-            weekly_capture(baseline["body"], payload["p_body"], actor["display_name"])
-
-    headers = {"apikey": KEY, "Content-Type": "application/json"}
-
-    if token:
-
-        headers["Authorization"] = "Bearer " + token
-
-    request = urllib.request.Request(
-
-        URL + path, headers=headers, method=method,
-
-        data=None if payload is None else json.dumps(payload).encode(),
-
-    )
-
-    try:
-
-        with urllib.request.urlopen(request, timeout=20) as response:
-
-            return json.load(response)
-
-    except urllib.error.HTTPError as error:
-
-        try:
-
-            detail = json.loads(error.read())
-
-            message = detail.get("msg") or detail.get("message") or ""
-
-        except Exception:
-
-            message = ""
-
-        raise RuntimeError(message or f"서버 요청 실패 ({error.code})") from None
-
-
-
-
-
-def session_token():
-
-    session = st.session_state.get("auth")
-
-    if not session:
-
-        return None
-
-    if session.get("expires_at", 0) < time.time() + 60:
-
-        session = api("/auth/v1/token?grant_type=refresh_token", "POST", {
-
-            "refresh_token": session["refresh_token"],
-
-        })
-
-        session.setdefault("expires_at", time.time() + session.get("expires_in", 3600))
-
-        st.session_state.auth = session
-
-    return session["access_token"]
-
-
-
-
-
+"""Operation: Streamlit UI with Supabase Auth and authenticated shared storage."""
+
+
+
+
+
+import json
+
+
+
+
+
+import os
+
+
+
+
+
+import time
+
+
+
+
+
+import uuid
+
+
+
+
+
+import hashlib
+
+
+
+
+
+from datetime import datetime, timezone
+
+
+
+
+
+from zoneinfo import ZoneInfo
+
+
+
+
+
+import urllib.error
+
+
+
+
+
+import urllib.request
+
+
+
+
+
+from pathlib import Path
+
+
+
+
+
+
+
+
+
+
+
+import streamlit as st
+
+
+
+
+
+# Read cached worksheet values without running workbook macros or formulas.
+
+
+
+
+
+import io
+
+
+
+
+
+import re
+
+
+
+
+
+import zipfile
+
+
+
+
+
+import posixpath
+
+
+
+
+
+from datetime import datetime, timedelta, timezone
+
+
+
+
+
+from xml.etree import ElementTree as ET
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def parse_order_workbook(blob, filename, source_url=""):
+
+
+
+
+
+    if len(blob) > 15 * 1024 * 1024:
+
+
+
+
+
+        raise ValueError("15MB 이하의 엑셀 파일을 선택해주세요.")
+
+
+
+
+
+    if not zipfile.is_zipfile(io.BytesIO(blob)):
+
+
+
+
+
+        raise ValueError("올바른 xlsx 또는 xlsm 파일이 아니에요.")
+
+
+
+
+
+    ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+
+
+
+
+    with zipfile.ZipFile(io.BytesIO(blob)) as z:
+
+
+
+
+
+        if sum(x.file_size for x in z.infolist()) > 100 * 1024 * 1024:
+
+
+
+
+
+            raise ValueError("엑셀 내부 데이터가 너무 큽니다.")
+
+
+
+
+
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+
+
+
+
+
+        sheet = next((s for s in wb.findall("s:sheets/s:sheet", ns)
+
+
+
+
+
+                      if s.attrib.get("name", "").strip().lower() == "open so status"), None)
+
+
+
+
+
+        if sheet is None:
+
+
+
+
+
+            raise ValueError("Open SO Status 시트를 찾지 못했어요.")
+
+
+
+
+
+        rid = sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
+
+
+
+
+
+        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+
+
+
+
+
+        target = next(r.attrib["Target"] for r in rels if r.attrib["Id"] == rid)
+
+
+
+
+
+        path = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
+
+
+
+
+
+        strings = []
+
+
+
+
+
+        if "xl/sharedStrings.xml" in z.namelist():
+
+
+
+
+
+            strings = ["".join(si.itertext()) for si in ET.fromstring(z.read("xl/sharedStrings.xml"))]
+
+
+
+
+
+        rows = []
+
+
+
+
+
+        for row in ET.fromstring(z.read(path)).findall("s:sheetData/s:row", ns):
+
+
+
+
+
+            cells = {}
+
+
+
+
+
+            for c in row.findall("s:c", ns):
+
+
+
+
+
+                col = re.sub(r"\d", "", c.attrib["r"])
+
+
+
+
+
+                value = c.findtext("s:v", default="", namespaces=ns)
+
+
+
+
+
+                kind = c.attrib.get("t")
+
+
+
+
+
+                if kind == "s":
+
+
+
+
+
+                    value = strings[int(value)] if value else ""
+
+
+
+
+
+                elif kind == "inlineStr":
+
+
+
+
+
+                    value = "".join(c.find("s:is", ns).itertext())
+
+
+
+
+
+                cells[col] = value.strip()
+
+
+
+
+
+            rows.append((int(row.attrib["r"]), cells))
+
+
+
+
+
+        header = next(((n, r) for n, r in rows if r.get("C", "").upper() == "STATUS"
+
+
+
+
+
+                       and r.get("H", "").upper() == "CUSTOMER" and r.get("J", "").upper() == "ORDER VALUE"), None)
+
+
+
+
+
+        if not header:
+
+
+
+
+
+            raise ValueError("Status / Customer / Order Value 열 구성이 달라요. 기존 요약은 유지됩니다.")
+
+
+
+
+
+        props = wb.find("s:workbookPr", ns)
+
+
+
+
+
+        epoch = datetime(1904, 1, 1) if props is not None and props.attrib.get("date1904") in ("1", "true") else datetime(1899, 12, 30)
+
+
+
+
+
+        def date(value):
+
+
+
+
+
+            try:
+
+
+
+
+
+                return (epoch + timedelta(days=float(value))).date().isoformat() if value else ""
+
+
+
+
+
+            except (ValueError, OverflowError):
+
+
+
+
+
+                return value
+
+
+
+
+
+        orders, excluded, ids = [], {}, set()
+
+
+
+
+
+        for n, r in rows:
+
+
+
+
+
+            if n <= header[0] or not (r.get("B") or r.get("H") or r.get("I")):
+
+
+
+
+
+                continue
+
+
+
+
+
+            status = re.sub(r"\s+", " ", r.get("C", "").upper())
+
+
+
+
+
+            if status.startswith("#"):
+
+
+
+
+
+                raise ValueError(f"{n}행의 상태에 엑셀 오류가 있어요.")
+
+
+
+
+
+            if "SENT" in status or status in ("CANCELLED", "CANCELED"):
+
+
+
+
+
+                excluded[status] = excluded.get(status, 0) + 1
+
+
+
+
+
+                continue
+
+
+
+
+
+            if not status or not r.get("H"):
+
+
+
+
+
+                raise ValueError(f"{n}행에 상태 또는 회사명이 없어 집계하지 못했어요.")
+
+
+
+
+
+            key = (r.get("H"), r.get("B"), r.get("I"))
+
+
+
+
+
+            if key in ids:
+
+
+
+
+
+                raise ValueError(f"{n}행의 PO/SO가 중복돼요. 중복 여부를 확인해주세요.")
+
+
+
+
+
+            ids.add(key)
+
+
+
+
+
+            try:
+
+
+
+
+
+                amount = round(float(r["J"]), 2) if r.get("J") else None
+
+
+
+
+
+                if amount is not None and not (-1e12 < amount < 1e12):
+
+
+
+
+
+                    raise ValueError()
+
+
+
+
+
+            except ValueError:
+
+
+
+
+
+                raise ValueError(f"{n}행의 금액을 읽을 수 없어요.")
+
+
+
+
+
+            orders.append({"row": n, "status": status, "customer": r["H"],
+
+
+
+
+
+                           "po": r.get("B", ""), "so": r.get("I", ""), "amount": amount,
+
+
+
+
+
+                           "poDate": date(r.get("D", "")), "readyDate": date(r.get("E", "")),
+
+
+
+
+
+                           "shipFrom": r.get("G", ""), "note": r.get("O", "")})
+
+
+
+
+
+        return {"version": 1, "orders": orders, "excluded": excluded,
+
+
+
+
+
+                "sourceFile": filename, "sourceSheet": "Open SO Status", "sourceUrl": source_url,
+
+
+
+
+
+                "checkedAt": datetime.now(timezone.utc).isoformat(), "sourceRows": len(rows) - header[0]}
+
+
+
+
+
+
+
+
+
+
+
+# Evidence-based weekly reporting; no external AI calls or workbook writes.
+
+
+
+
+
+import copy
+
+
+
+
+
+import hashlib
+
+
+
+
+
+import json
+
+
+
+
+
+import html
+
+
+
+
+
+import re
+
+
+
+
+
+# Reference layout only; no source report contents.
+
+
+
+
+
+WEEKLY_TEMPLATES = {'Hugo': {'rows': [[{'ref': 'B1', 'text': '🫡', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'C1', 'text': 'Hugo', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'D1', 'text': 'Goal / Priority / Deliverable', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E1', 'text': 'Category', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F1', 'text': 'Review / Plan', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}], [{'ref': 'B2', 'text': 'Agenda', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [16, 1], 'slot': False}, {'ref': 'C2', 'text': '1. Previous Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [3, 1], 'slot': False}, {'ref': 'D2', 'text': 'Summary of Previous Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E2', 'text': 'US', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F2', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'D3', 'text': 'Meaningful Accomplishments', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E3', 'text': 'US', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'D4', 'text': 'Biggest Roadblock(s)', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'E4', 'text': 'Amazon', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F4', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'C5', 'text': '2. This Week', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [13, 1], 'slot': False}, {'ref': 'D5', 'text': 'This Weeks Goals', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [13, 1], 'slot': False}, {'ref': 'E5', 'text': 'Line Review', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'F5', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F6', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F7', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#D0E0E3;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F8', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F9', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F10', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFF2CC;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F11', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E12', 'text': 'Excessive Units', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F12', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E13', 'text': 'Amazon', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F13', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E14', 'text': 'EU', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F14', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E15', 'text': 'Channel Setup', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;', 'span': [3, 1], 'slot': False}, {'ref': 'F15', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F16', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'F17', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'B18', 'text': 'Additional Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:normal;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 4], 'slot': False}, {'ref': 'F18', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}]], 'widths': [9.29, 10.86, 28.29, 9.43, 103.43], 'slots': ['F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17', 'F18'], 'sourceStart': 1156}, 'Jayna': {'rows': [[{'ref': 'B1', 'text': '🦋', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'C1', 'text': 'Jayna', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'D1', 'text': 'Goal / Priority / Deliverable', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'F1', 'text': 'Review / Plan', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#DEEAF6;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}], [{'ref': 'B2', 'text': 'Previous Week Meeting Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'D2', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 3], 'slot': True}], [{'ref': 'B3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'C3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'D3', 'text': 'Ongoing', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-right:1px solid #000;border-top:1px solid #000;', 'span': [7, 1], 'slot': False}, {'ref': 'E3', 'text': 'Power Bank Compliance', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FCE5CD;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F3', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E4', 'text': 'EOT Series main image refresh', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F4', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E5', 'text': 'Amazon Andon Cord ', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F5', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E6', 'text': 'BBY MP / Macys MP', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F6', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:top;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E7', 'text': 'AAFES', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F7', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E8', 'text': 'TikTok', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F8', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'E9', 'text': 'NL Shipment Status', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#EAD1DC;font-weight:bold;text-align:left;vertical-align:middle;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': False}, {'ref': 'F9', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-right:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 1], 'slot': True}], [{'ref': 'B10', 'text': 'Final Notes', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFCC;font-weight:bold;text-align:center;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-left:1px solid #000;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 2], 'slot': False}, {'ref': 'D10', 'text': '', 'css': 'font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#000;background:#FFFFFF;font-weight:normal;text-align:left;vertical-align:bottom;white-space:pre-wrap;overflow-wrap:anywhere;padding:4px;border-top:1px solid #000;border-bottom:1px solid #000;', 'span': [1, 3], 'slot': True}]], 'widths': [15.0, 17.57, 15.86, 28.57, 120.57], 'slots': ['D2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'D10'], 'sourceStart': 522}}
+
+
+
+
+
+
+
+
+
+
+
+from datetime import date, datetime, timedelta, timezone
+
+
+
+
+
+from zoneinfo import ZoneInfo
+
+
+
+
+
+
+
+
+
+
+
+WEEKLY_SECTIONS = ['Summary of Previous Week', 'Meaningful Accomplishments',
+
+
+
+
+
+                   'Biggest Roadblock(s)', 'This Weeks Goals', 'Final Deliverable', 'Final Notes']
+
+
+
+
+
+
+
+
+
+
+
+def weekly_person(value):
+
+
+
+
+
+    return 'Jayna' if value == '제이나' else value
+
+
+
+
+
+
+
+
+
+
+
+def weekly_day(value):
+
+
+
+
+
+    if not value:
+
+
+
+
+
+        return ''
+
+
+
+
+
+    try:
+
+
+
+
+
+        if len(value) == 10:
+
+
+
+
+
+            return date.fromisoformat(value).isoformat()
+
+
+
+
+
+        return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(ZoneInfo('America/New_York')).date().isoformat()
+
+
+
+
+
+    except (ValueError, TypeError):
+
+
+
+
+
+        return ''
+
+
+
+
+
+
+
+
+
+
+
+def weekly_monday(value):
+
+
+
+
+
+    d = date.fromisoformat(value)
+
+
+
+
+
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+
+
+
+
+
+
+
+
+
+def weekly_snapshot(item):
+
+
+
+
+
+    keys = ['id', 'title', 'area', 'owner', 'status', 'progress', 'note', 'result',
+
+
+
+
+
+            'link', 'emailSubject', 'due', 'weekGoal', 'helpRequest', 'helpOffer']
+
+
+
+
+
+    return {k: copy.deepcopy(item.get(k)) for k in keys}
+
+
+
+
+
+
+
+
+
+
+
+def weekly_capture(old, new, actor, stamp=None):
+
+
+
+
+
+    stamp = stamp or datetime.now(timezone.utc).isoformat()
+
+
+
+
+
+    who = weekly_person(actor)
+
+
+
+
+
+    history = copy.deepcopy(old.get('weeklyActivity', []))
+
+
+
+
+
+    known = {x['id'] for x in history}
+
+
+
+
+
+    def add(kind, item, fields, at, author, text='', legacy=False):
+
+
+
+
+
+        if not weekly_day(at) or not author:
+
+
+
+
+
+            return
+
+
+
+
+
+        record = dict(kind=kind, task=weekly_snapshot(item), fields=fields, at=at,
+
+
+
+
+
+                      actor=weekly_person(author), text=text, legacy=legacy)
+
+
+
+
+
+        record['id'] = hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
+
+
+
+
+
+        if record['id'] not in known:
+
+
+
+
+
+            history.append(record)
+
+
+
+
+
+            known.add(record['id'])
+
+
+
+
+
+    # One-time conservative import: only dated, attributed facts, never inferred activity.
+
+
+
+
+
+    if not old.get('weeklyTrackingSince'):
+
+
+
+
+
+        for item in old.get('items', []):
+
+
+
+
+
+            if item.get('noteUpdatedBy'):
+
+
+
+
+
+                add('note', item, ['note', 'result', 'link', 'emailSubject'], item.get('noteUpdatedTime') or item.get('noteUpdatedAt'), item['noteUpdatedBy'], legacy=True)
+
+
+
+
+
+            if item.get('completedBy') and item.get('status') == 'complete':
+
+
+
+
+
+                add('completion', item, ['status'], item.get('completedTime'), item['completedBy'], legacy=True)
+
+
+
+
+
+            if item.get('progressUpdatedBy'):
+
+
+
+
+
+                add('progress', item, ['progress'], item.get('progressUpdatedAt'), item['progressUpdatedBy'], legacy=True)
+
+
+
+
+
+            for day, check in item.get('checks', {}).items():
+
+
+
+
+
+                for name, checked in check.get('people', {}).items():
+
+
+
+
+
+                    if checked:
+
+
+
+
+
+                        add('daily', item, ['checks'], day, name, legacy=True)
+
+
+
+
+
+    old_items = {x['id']: x for x in old.get('items', [])}
+
+
+
+
+
+    for item in new.get('items', []):
+
+
+
+
+
+        previous = old_items.get(item['id'], {})
+
+
+
+
+
+        fields = [k for k in weekly_snapshot(item) if item.get(k) != previous.get(k)]
+
+
+
+
+
+        if fields:
+
+
+
+
+
+            kind = 'completion' if item.get('status') == 'complete' and previous.get('status') != 'complete' else 'created' if not previous else 'update'
+
+
+
+
+
+            add(kind, item, fields, stamp, who)
+
+
+
+
+
+        for day, check in item.get('checks', {}).items():
+
+
+
+
+
+            prior = previous.get('checks', {}).get(day, {}).get('people', {})
+
+
+
+
+
+            for name, checked in check.get('people', {}).items():
+
+
+
+
+
+                if checked and not prior.get(name):
+
+
+
+
+
+                    add('daily', item, ['checks'], day, name)
+
+
+
+
+
+    new['weeklyActivity'] = history
+
+
+
+
+
+    new['weeklyTrackingSince'] = old.get('weeklyTrackingSince') or stamp
+
+
+
+
+
+    plans = copy.deepcopy(old.get('weeklyPlans', {}))
+
+
+
+
+
+    week = weekly_monday(weekly_day(stamp))
+
+
+
+
+
+    end = (date.fromisoformat(week) + timedelta(days=6)).isoformat()
+
+
+
+
+
+    plans[week] = [weekly_snapshot(x) for x in new.get('items', [])
+
+
+
+
+
+                   if x.get('status') == 'active' and not x.get('daily') and
+
+
+
+
+
+                   (x.get('weekGoal') == week or week <= (x.get('due') or '') <= end)]
+
+
+
+
+
+    new['weeklyPlans'] = plans
+
+
+
+
+
+    progress = copy.deepcopy(old.get('weeklyProgress', {}))
+
+
+
+
+
+    progress[week] = [weekly_snapshot(x) for x in new.get('items', [])
+
+
+
+
+
+                      if x.get('status') == 'active' and not x.get('daily') and x.get('progress', 0)]
+
+
+
+
+
+    new['weeklyProgress'] = progress
+
+
+
+
+
+
+
+
+
+
+
+def weekly_iottie_only(value):
+
+
+
+
+
+    text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+
+
+
+
+
+    return not re.search(r'shoppe|shopee|duo[\s_-]*green|듀오\s*그린|쇼피|쇼페', text, re.IGNORECASE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def weekly_evidence(body, person, week):
+
+
+
+
+
+    start = date.fromisoformat(week)
+
+
+
+
+
+    previous = (start - timedelta(days=7)).isoformat()
+
+
+
+
+
+    end = (start + timedelta(days=7)).isoformat()
+
+
+
+
+
+    # Include available legacy evidence without mutating stored data.
+
+
+
+
+
+    view = copy.deepcopy(body)
+
+
+
+
+
+    if not body.get('weeklyTrackingSince'):
+
+
+
+
+
+        weekly_capture(body, view, person)
+
+
+
+
+
+    deleted = {x['id'] for x in body.get('items', []) if x.get('status') == 'deleted'}
+
+
+
+
+
+    records = [x for x in view.get('weeklyActivity', []) if x.get('actor') == person
+
+
+
+
+
+               and previous <= weekly_day(x.get('at')) < end and x.get('task', {}).get('id') not in deleted]
+
+
+
+
+
+    items = {x['id']: x for x in body.get('items', [])}
+
+
+
+
+
+    for c in body.get('comments', []):
+
+
+
+
+
+        if not c.get('deletedAt') and weekly_person(c.get('author')) == person and previous <= weekly_day(c.get('at')) < end:
+
+
+
+
+
+            task = items.get(c.get('taskId'), {})
+
+
+
+
+
+            records.append(dict(id=c['id'], kind='feedback', at=c['at'], actor=person,
+
+
+
+
+
+                                task={k: task.get(k) for k in ['id', 'title', 'area', 'owner']}, text=c.get('text', '')))
+
+
+
+
+
+    current = weekly_monday(datetime.now(ZoneInfo('America/New_York')).date().isoformat())
+
+
+
+
+
+    if week == current:
+
+
+
+
+
+        plans = [weekly_snapshot(x) for x in body.get('items', []) if x.get('status') == 'active' and not x.get('daily')
+
+
+
+
+
+                 and (x.get('weekGoal') == week or week <= (x.get('due') or '') < end)]
+
+
+
+
+
+    else:
+
+
+
+
+
+        plans = view.get('weeklyPlans', {}).get(week, [])
+
+
+
+
+
+    plans = [x for x in plans if weekly_person(x.get('owner')) == person or x.get('owner') == '함께']
+
+
+
+
+
+    progress = ([weekly_snapshot(x) for x in body.get('items', [])
+
+
+
+
+
+                 if x.get('status') == 'active' and not x.get('daily') and x.get('progress', 0)]
+
+
+
+
+
+                if week == current else body.get('weeklyProgress', {}).get(week, []))
+
+
+
+
+
+    progress = [x for x in progress if weekly_person(x.get('owner')) == person or x.get('owner') == '함께']
+
+
+
+
+
+    excluded_ids = {x['id'] for x in body.get('items', []) if not weekly_iottie_only(x)}
+
+
+
+
+
+    records = [x for x in records if x.get('task', {}).get('id') not in excluded_ids and weekly_iottie_only(x)]
+
+
+
+
+
+    plans = [x for x in plans if x.get('id') not in excluded_ids and weekly_iottie_only(x)]
+
+
+
+
+
+    progress = [x for x in progress if x.get('id') not in excluded_ids and weekly_iottie_only(x)]
+
+
+
+
+
+    evidence = dict(person=person, reportWeek=week, previousWeek=previous, scope='iOttie only; exclude Shoppe/Shopee and all DuoGreen work',
+
+
+
+
+
+                    activity=sorted(records, key=lambda x: x['at']), plans=plans, progress=progress,
+
+
+
+
+
+                    trackingSince=body.get('weeklyTrackingSince'),
+
+
+
+
+
+                    note='Activity is attributed to the actual editor; plans to the assigned owner. Shared tasks are not individual accomplishments. Legacy notes are latest available versions only. Do not infer earlier work, completion, or order-processing counts.')
+
+
+
+
+
+    fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
+
+
+
+
+
+    return evidence, fingerprint
+
+
+
+
+
+
+
+
+
+
+
+def weekly_template_values(person, draft, evidence):
+
+
+
+
+
+    template = WEEKLY_TEMPLATES[person]
+
+
+
+
+
+    values = {ref: '\n'.join(line for line in draft.get('cells', {}).get(ref, '').splitlines() if weekly_iottie_only(line)) for ref in template['slots']}
+
+
+
+
+
+    for ref in values:
+
+
+
+
+
+        if not weekly_iottie_only(draft.get('categories', {}).get('E' + ref[1:], '')):
+
+
+
+
+
+            values[ref] = ''
+
+
+
+
+
+    fallback = 'F18' if person == 'Hugo' else 'D10'
+
+
+
+
+
+    for task in evidence.get('progress', []):
+
+
+
+
+
+        mapping = draft.get('progressLabels', {}).get(task['id'], {})
+
+
+
+
+
+        ref = mapping.get('cell', fallback)
+
+
+
+
+
+        if ref not in values:
+
+
+
+
+
+            ref = fallback
+
+
+
+
+
+        title = mapping.get('title') or str(task.get('area') or '') + ' · ' + str(task.get('title') or '')
+
+
+
+
+
+        text = f"{title}: {task['progress']}% (in progress)."
+
+
+
+
+
+        if task.get('owner') == '함께':
+
+
+
+
+
+            text += ' Shared task.'
+
+
+
+
+
+        values[ref] = (values[ref] + '\n' + text).strip()
+
+
+
+
+
+    return values
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def weekly_layout(person, values, categories=None):
+
+
+
+
+
+    original = copy.deepcopy(WEEKLY_TEMPLATES[person]['rows'])
+
+
+
+
+
+    if categories is None:
+
+
+
+
+
+        return original
+
+
+
+
+
+    lo, hi = (5, 17) if person == 'Hugo' else (3, 9)
+
+
+
+
+
+    keep = [r for r in range(1, len(original) + 1)
+
+
+
+
+
+            if not lo <= r <= hi or values.get('F' + str(r), '').strip()]
+
+
+
+
+
+    for r in range(1, len(original) + 1):
+
+
+
+
+
+        if r in keep:
+
+
+
+
+
+            continue
+
+
+
+
+
+        for c in original[r - 1]:
+
+
+
+
+
+            if c['span'][0] > 1 and not c['ref'].startswith('E'):
+
+
+
+
+
+                survivors = [k for k in keep if r <= k < r + c['span'][0]]
+
+
+
+
+
+                if survivors:
+
+
+
+
+
+                    moved = copy.deepcopy(c)
+
+
+
+
+
+                    moved['span'][0] -= survivors[0] - r
+
+
+
+
+
+                    moved['ref'] = c['ref'][0] + str(survivors[0])
+
+
+
+
+
+                    original[survivors[0] - 1].append(moved)
+
+
+
+
+
+    rows = []
+
+
+
+
+
+    category_css = next(c['css'] for row in original for c in row if c['ref'] == ('E13' if person == 'Hugo' else 'E4'))
+
+
+
+
+
+    for r in keep:
+
+
+
+
+
+        row = []
+
+
+
+
+
+        for c in original[r - 1]:
+
+
+
+
+
+            if lo <= r <= hi and c['ref'].startswith('E'):
+
+
+
+
+
+                continue
+
+
+
+
+
+            c['span'][0] = len([k for k in keep if r <= k < r + c['span'][0]])
+
+
+
+
+
+            row.append(c)
+
+
+
+
+
+        if lo <= r <= hi:
+
+
+
+
+
+            row.append(dict(ref='E' + str(r), text=categories.get('E' + str(r), ''), css=category_css, span=[1, 1], slot=False))
+
+
+
+
+
+        row.sort(key=lambda c: c['ref'][0])
+
+
+
+
+
+        rows.append(row)
+
+
+
+
+
+    # Merge repeated customer categories while retaining the original parent groups.
+
+
+
+
+
+    last = None
+
+
+
+
+
+    for row in rows:
+
+
+
+
+
+        category = next((c for c in row if c['ref'].startswith('E') and lo <= int(c['ref'][1:]) <= hi), None)
+
+
+
+
+
+        if category and category['text'] and last and last['text'] == category['text']:
+
+
+
+
+
+            last['span'][0] += 1
+
+
+
+
+
+            row.remove(category)
+
+
+
+
+
+        else:
+
+
+
+
+
+            last = category
+
+
+
+
+
+    return rows
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def weekly_template_html(person, values, categories=None, feedback=None):
+
+
+
+
+
+    template = WEEKLY_TEMPLATES[person]
+
+
+
+
+
+    widths = ([6, 11, 22, 15, 46] if person == 'Hugo' else [8, 9, 10, 18, 55]) if categories is not None else template['widths']
+
+
+
+
+
+    if feedback is not None:
+
+
+
+
+
+        widths = list(widths) + [sum(widths) * .34]
+
+
+
+
+
+    total = sum(widths)
+
+
+
+
+
+    cols = ''.join(f'<col style="width:{w / total * 100:.3f}%">' for w in widths)
+
+
+
+
+
+    rendered = []
+
+
+
+
+
+    for row_index, row in enumerate(weekly_layout(person, values, categories)):
+
+
+
+
+
+        cells = []
+
+
+
+
+
+        for c in row:
+
+
+
+
+
+            value = values.get(c['ref'], '') if c['slot'] else c['text']
+
+
+
+
+
+            cells.append(f'<td rowspan="{c["span"][0]}" colspan="{c["span"][1]}" style="{c["css"]}">{html.escape(value)}</td>')
+
+
+
+
+
+        if feedback is not None:
+
+
+
+
+
+            style = 'border:1px solid #222;background:#fff;color:#111;padding:6px;font:11pt Calibri,Arial,sans-serif;vertical-align:top;'
+
+
+
+
+
+            if row_index == 0:
+
+
+
+
+
+                cells.append('<th style="' + style + 'font-weight:bold;text-align:center;background:#eee;">Feedback</th>')
+
+
+
+
+
+            else:
+
+
+
+
+
+                ref = next((c['ref'] for c in row if c['slot']), None)
+
+
+
+
+
+                if ref:
+
+
+
+
+
+                    value = feedback.get(ref, '')
+
+
+
+
+
+                    cells.append('<td style="' + style + '"><textarea aria-label="Feedback ' + ref + '" data-feedback="' + ref + '" placeholder="수정하고 싶은 내용을 적어주세요" style="display:block;box-sizing:border-box;width:100%;min-height:64px;resize:vertical;border:0;outline:1px solid transparent;background:white;color:#111;font:11pt/1.4 Calibri,Arial,sans-serif;overflow:hidden;">' + html.escape(value) + '</textarea></td>')
+
+
+
+
+
+                else:
+
+
+
+
+
+                    cells.append('<td style="' + style + '"></td>')
+
+
+
+
+
+        rendered.append('<tr>' + ''.join(cells) + '</tr>')
+
+
+
+
+
+    return '<table style="border-collapse:collapse;table-layout:fixed;width:100%;"><colgroup>' + cols + '</colgroup>' + ''.join(rendered) + '</table>'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def weekly_template_copy(st, person, values, categories=None, feedback=None, feedback_key=''):
+
+
+
+
+
+    import csv
+
+
+
+
+
+    import io
+
+
+
+
+
+    layout = weekly_layout(person, values, categories)
+
+
+
+
+
+    grid = [[''] * 5 for _ in layout]
+
+
+
+
+
+    for r, row in enumerate(layout):
+
+
+
+
+
+        for c in row:
+
+
+
+
+
+            col = ord(c['ref'][0]) - ord('B')
+
+
+
+
+
+            grid[r][col] = values.get(c['ref'], '') if c['slot'] else c['text']
+
+
+
+
+
+    output = io.StringIO()
+
+
+
+
+
+    csv.writer(output, delimiter='\t', lineterminator='\n').writerows(grid)
+
+
+
+
+
+    component = st.components.v2.component('weekly_original_template_feedback_v1', html='<div id="weekly-template"></div>', js="""
+
+
+
+
+
+export default function({parentElement,data,setTriggerValue}) {
+
+
+
+
+
+ const root=parentElement.querySelector('#weekly-template');
+
+
+
+
+
+ root.innerHTML='<button id="copy" style="background:#235b92;color:white;border:1px solid #7195bb;border-radius:6px;padding:10px 16px;cursor:pointer;margin-bottom:12px">원본 표 전체 복사 · 병합·서식 포함</button> <button id="save-feedback" style="background:#eee;color:#111;border:1px solid #555;border-radius:6px;padding:10px 16px;cursor:pointer">Feedback 저장</button><span role="status" style="margin-left:12px"></span><div style="overflow-x:auto">'+data.preview+'</div>';
+
+
+
+
+
+ const boxes=[...root.querySelectorAll('[data-feedback]')];
+
+
+
+
+
+ const resize=box=>{box.style.height='64px';box.style.height=Math.max(64,box.scrollHeight)+'px';};
+
+
+
+
+
+ boxes.forEach(box=>{resize(box);box.oninput=()=>{resize(box);root.querySelector('[role=status]').textContent='Feedback 변경됨 · 저장해주세요';};});
+
+
+
+
+
+ root.querySelector('#save-feedback').onclick=()=>{
+
+
+
+
+
+   const values=Object.fromEntries(boxes.map(box=>[box.dataset.feedback,box.value]));
+
+
+
+
+
+   setTriggerValue('feedbackSave',{id:crypto.randomUUID(),values,base:data.feedback});
+
+
+
+
+
+   root.querySelector('[role=status]').textContent='Feedback 저장 중…';
+
+
+
+
+
+ };
+
+
+
+
+
+ root.querySelector('#copy').onclick=async()=>{
+
+
+
+
+
+  let ok=false;
+
+
+
+
+
+  try {await navigator.clipboard.write([new ClipboardItem({'text/html':new Blob([data.html],{type:'text/html'}),'text/plain':new Blob([data.plain],{type:'text/plain'})})]);ok=true;}
+
+
+
+
+
+  catch (_) {const handler=e=>{e.clipboardData.setData('text/html',data.html);e.clipboardData.setData('text/plain',data.plain);e.preventDefault();};document.addEventListener('copy',handler);ok=document.execCommand('copy');document.removeEventListener('copy',handler);}
+
+
+
+
+
+  root.querySelector('[role=status]').textContent=ok?'복사했어요 · 시트의 빈 영역 B열에 붙여넣기':'복사가 차단됐어요. 브라우저 복사 권한을 확인해주세요.';
+
+
+
+
+
+ };
+
+
+
+
+
+}
+
+
+
+
+
+""")
+
+
+
+
+
+    return component(data=dict(html=weekly_template_html(person, values, categories), preview=weekly_template_html(person, values, categories, feedback or {}), feedback=feedback or {}, plain=output.getvalue().rstrip('\n')), key='weekly_original_template_' + feedback_key, on_feedbackSave_change=lambda: None)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def weekly_render(st, body, actor, save):
+
+
+
+
+
+    st.header('Weekly · 주간 보고')
+
+
+
+
+
+    st.caption('기록은 주차별로 모이고, 영어 초안은 업무시간 중 매시간 정리됩니다. 원문을 확인한 뒤 복사하세요.')
+
+
+
+
+
+    if st.button('새 기록 불러오기', key='weekly_refresh'):
+
+
+
+
+
+        st.rerun()
+
+
+
+
+
+    c1, c2 = st.columns(2)
+
+
+
+
+
+    person = c1.selectbox('이름', ['Hugo', 'Jayna'], index=0 if weekly_person(actor) == 'Hugo' else 1)
+
+
+
+
+
+    picked = c2.date_input('보고 주차 · 해당 주의 날짜 선택', value=datetime.now(ZoneInfo('America/New_York')).date())
+
+
+
+
+
+    week = weekly_monday(picked.isoformat())
+
+
+
+
+
+    friday = (date.fromisoformat(week) + timedelta(days=4)).strftime('%m/%d')
+
+
+
+
+
+    evidence, fingerprint = weekly_evidence(body, person, week)
+
+
+
+
+
+    key = week + ':' + person
+
+
+
+
+
+    draft = body.get('weeklyDrafts', {}).get(key, {})
+
+
+
+
+
+    st.subheader(f"{person} · Week of {date.fromisoformat(week).strftime('%m/%d')}–{friday}")
+
+
+
+
+
+    st.caption(f"{person} 원본 표의 큰 분류·서식 유지 · 세부 카테고리는 실제 업무에 맞춰 정리 · 미완료 진행률 포함")
+
+
+
+
+
+    if draft.get('formatVersion') != 4:
+
+
+
+
+
+        st.info('원본 표 형식의 영어 초안을 준비하고 있습니다. 진행률은 바로 표시됩니다.')
+
+
+
+
+
+    elif draft.get('fingerprint') != fingerprint:
+
+
+
+
+
+        st.warning('새 기록이 있습니다. 아래 영어 초안은 아직 최신 기록을 모두 반영하지 않았어요.')
+
+
+
+
+
+    else:
+
+
+
+
+
+        st.success('현재 수집된 기록을 반영한 영어 초안입니다.')
+
+
+
+
+
+    if draft:
+
+
+
+
+
+        st.caption('초안 정리 시각: ' + draft.get('updatedAt', '') + ' · ' + draft.get('by', ''))
+
+
+
+
+
+    st.markdown('#### 복사할 영어 초안')
+
+
+
+
+
+    st.caption('원본 표 형식으로 복사됩니다. 세부 카테고리와 행 수는 이번 주 업무에 맞춰 정리되므로, 시트의 빈 영역 B열에 붙여넣으세요. 100%도 완료 버튼을 누르기 전에는 진행 중으로 표시합니다.')
+
+
+
+
+
+    st.caption('오른쪽 Feedback에 수정 요청을 적고 저장한 뒤 표를 스크린샷으로 전달하세요. 원본 표 복사에는 Feedback이 포함되지 않습니다.')
+
+
+
+
+
+    feedback = body.get('weeklyFeedback', {}).get(key, {})
+
+
+
+
+
+    feedback_result = weekly_template_copy(st, person, weekly_template_values(person, draft, evidence), draft.get('categories'), feedback, key)
+
+
+
+
+
+    feedback_change = feedback_result.get('feedbackSave')
+
+
+
+
+
+    if feedback_change and st.session_state.get('weekly_feedback_handled') != feedback_change.get('id'):
+
+
+
+
+
+        try:
+
+
+
+
+
+            values = feedback_change.get('values', {})
+
+
+
+
+
+            base = feedback_change.get('base', {})
+
+
+
+
+
+            if not isinstance(values, dict) or any(ref not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(text, str) or len(text) > 5000 for ref, text in values.items()):
+
+
+
+
+
+                raise ValueError('Feedback은 각 칸에 5,000자 이내로 입력해주세요.')
+
+
+
+
+
+            def update_feedback(latest):
+
+
+
+
+
+                target = latest.setdefault('weeklyFeedback', {}).setdefault(key, {})
+
+
+
+
+
+                for ref, text in values.items():
+
+
+
+
+
+                    if text == base.get(ref, ''):
+
+
+
+
+
+                        continue
+
+
+
+
+
+                    if target.get(ref, '') != base.get(ref, ''):
+
+
+
+
+
+                        raise RuntimeError('같은 Feedback을 다른 사람이 수정했어요. 새로고침 후 다시 확인해주세요.')
+
+
+
+
+
+                    target[ref] = text
+
+
+
+
+
+            save(update_feedback, person + ' Weekly Feedback을 저장했어요')
+
+
+
+
+
+            st.session_state.weekly_feedback_handled = feedback_change['id']
+
+
+
+
+
+            st.session_state.weekly_feedback_saved = key
+
+
+
+
+
+            st.rerun()
+
+
+
+
+
+        except (RuntimeError, ValueError) as exc:
+
+
+
+
+
+            st.error(str(exc))
+
+
+
+
+
+    if st.session_state.get('weekly_feedback_saved') == key:
+
+
+
+
+
+        st.caption('Feedback을 저장했어요.')
+
+
+
+
+
+    if draft.get('sections') and weekly_iottie_only(draft['sections']):
+
+
+
+
+
+        with st.expander('이전 6항목 초안 · 보관'):
+
+
+
+
+
+            for label, text in draft['sections'].items():
+
+
+
+
+
+                st.markdown('**' + label + '**')
+
+
+
+
+
+                st.write(text)
+
+
+
+
+
+    with st.expander('원문 근거 · 작성자와 날짜'):
+
+
+
+
+
+        st.caption('과거 기록이 부족한 주는 빈 부분이 생길 수 있습니다. 완료와 계획을 구분하며, 오더 건수는 자동 성과로 포함하지 않습니다.')
+
+
+
+
+
+        for label, lo, hi in [('지난주 기록', evidence['previousWeek'], week), ('이번 주 진행 기록', week, (date.fromisoformat(week)+timedelta(days=7)).isoformat())]:
+
+
+
+
+
+            with st.expander(label, expanded=False):
+
+
+
+
+
+                matched = [x for x in evidence['activity'] if lo <= weekly_day(x['at']) < hi]
+
+
+
+
+
+                if not matched:
+
+
+
+
+
+                    st.caption('날짜와 작성자가 확인되는 기록이 없습니다.')
+
+
+
+
+
+                for x in matched:
+
+
+
+
+
+                    t = x['task']
+
+
+
+
+
+                    st.markdown('**' + str(t.get('area') or '전체') + ' · ' + str(t.get('title') or '메모') + '**')
+
+
+
+
+
+                    st.caption(f"{x['actor']} · {x['at']} · {x['kind']}" + (' · 기존 최신 기록' if x.get('legacy') else ''))
+
+
+
+
+
+                    if x.get('text'):
+
+
+
+
+
+                        st.write(x['text'])
+
+
+
+
+
+                    for field in x.get('fields', []):
+
+
+
+
+
+                        if field in ['note','result','link','emailSubject','progress','status','due','helpRequest'] and t.get(field) is not None:
+
+
+
+
+
+                            st.write(f"{field}: {t[field]}")
+
+
+
+
+
+        with st.expander('이번 주 목표 · 담당 업무', expanded=False):
+
+
+
+
+
+            for t in evidence['plans']:
+
+
+
+
+
+                st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress') or 0}% · 마감 {t.get('due') or '미정'} · 담당 {t.get('owner')}")
+
+
+
+
+
+        with st.expander('완료 전 진행률 · 담당 업무 전체'):
+
+
+
+
+
+            for t in evidence['progress']:
+
+
+
+
+
+                st.write(f"{t.get('area')} · {t.get('title')} · {t.get('progress')}% · 진행 중 · 담당 {t.get('owner')}")
+
+
+
+
+
+        with st.expander('초안 작성용 원문 데이터'):
+
+
+
+
+
+            st.code(json.dumps(evidence, ensure_ascii=False, indent=2), language='json')
+
+
+
+
+
+            st.caption('근거 ID: ' + fingerprint)
+
+
+
+
+
+    with st.expander('영어 초안 편집 / 저장'):
+
+
+
+
+
+        with st.form('weekly_draft_' + key + '_' + fingerprint):
+
+
+
+
+
+            st.caption('큰 분류와 서식은 유지하고 세부 카테고리는 업무에 맞춰 조정합니다. 진행률 숫자는 원본 업무에서 자동 반영됩니다.')
+
+
+
+
+
+            st.caption('내용 셀: ' + ', '.join(WEEKLY_TEMPLATES[person]['slots']))
+
+
+
+
+
+            edited = st.text_area('원본 표 내용 · JSON', value=json.dumps(dict(cells=draft.get('cells', {}), categories=draft.get('categories', {}), progressLabels=draft.get('progressLabels', {})), ensure_ascii=False, indent=2), height=300)
+
+
+
+
+
+            if st.form_submit_button('영어 초안 저장'):
+
+
+
+
+
+                def update(latest):
+
+
+
+
+
+                    _, actual = weekly_evidence(latest, person, week)
+
+
+
+
+
+                    if actual != fingerprint:
+
+
+
+
+
+                        raise RuntimeError('새 업무 기록이 들어왔어요. 새로고침 후 최신 근거로 저장해주세요.')
+
+
+
+
+
+                    current_draft = latest.get('weeklyDrafts', {}).get(key, {})
+
+
+
+
+
+                    if current_draft != draft:
+
+
+
+
+
+                        raise RuntimeError('다른 사람이 초안을 수정했어요. 새로고침 후 다시 저장해주세요.')
+
+
+
+
+
+                    latest.setdefault('weeklyDrafts', {})[key] = dict(current_draft, **parsed, formatVersion=4, fingerprint=fingerprint,
+
+
+
+
+
+                        updatedAt=datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M'), by=actor)
+
+
+
+
+
+                try:
+
+
+
+
+
+                    parsed = json.loads(edited)
+
+
+
+
+
+                    if not isinstance(parsed, dict) or set(parsed) != {'cells', 'categories', 'progressLabels'}:
+
+
+
+
+
+                        raise ValueError('cells, categories, progressLabels를 입력해주세요.')
+
+
+
+
+
+                    allowed_categories = ['E' + str(r) for r in (range(5, 18) if person == 'Hugo' else range(3, 10))]
+
+
+
+
+
+                    if not isinstance(parsed['categories'], dict) or any(k not in allowed_categories or not isinstance(v, str) for k, v in parsed['categories'].items()):
+
+
+
+
+
+                        raise ValueError('세부 카테고리 셀과 이름을 확인해주세요.')
+
+
+
+
+
+                    if not isinstance(parsed['cells'], dict) or any(k not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v, str) for k, v in parsed['cells'].items()):
+
+
+
+
+
+                        raise ValueError('허용된 내용 셀과 텍스트만 입력해주세요.')
+
+
+
+
+
+                    if not isinstance(parsed['progressLabels'], dict) or any(not isinstance(v, dict) or v.get('cell') not in WEEKLY_TEMPLATES[person]['slots'] or not isinstance(v.get('title'), str) for v in parsed['progressLabels'].values()):
+
+
+
+
+
+                        raise ValueError('진행률 업무의 영어 제목과 표시 셀을 확인해주세요.')
+
+
+
+
+
+                    save(update, person + ' Weekly 영어 초안을 정리했어요')
+
+
+
+
+
+                    st.rerun()
+
+
+
+
+
+                except (RuntimeError, ValueError) as exc:
+
+
+
+
+
+                    st.error(str(exc))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+HERE = Path(__file__).parent
+
+
+
+
+
+st.set_page_config(page_title="Operation", page_icon="📋", layout="wide")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def setting(name, default=""):
+
+
+
+
+
+    if os.environ.get(name):
+
+
+
+
+
+        return os.environ[name]
+
+
+
+
+
+    try:
+
+
+
+
+
+        return st.secrets.get(name, default)
+
+
+
+
+
+    except Exception:
+
+
+
+
+
+        return default
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+URL = setting("SUPABASE_URL").rstrip("/")
+
+
+
+
+
+KEY = setting("SUPABASE_PUBLISHABLE_KEY")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def api(path, method="GET", payload=None, token=None):
+
+
+
+
+
+    if path == "/rest/v1/rpc/operation_save" and payload and token:
+
+
+
+
+
+        baseline = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)[0]
+
+
+
+
+
+        if baseline["revision"] == payload["p_expected_revision"]:
+
+
+
+
+
+            weekly_capture(baseline["body"], payload["p_body"], actor["display_name"])
+
+
+
+
+
+    headers = {"apikey": KEY, "Content-Type": "application/json"}
+
+
+
+
+
+    if token:
+
+
+
+
+
+        headers["Authorization"] = "Bearer " + token
+
+
+
+
+
+    request = urllib.request.Request(
+
+
+
+
+
+        URL + path, headers=headers, method=method,
+
+
+
+
+
+        data=None if payload is None else json.dumps(payload).encode(),
+
+
+
+
+
+    )
+
+
+
+
+
+    try:
+
+
+
+
+
+        with urllib.request.urlopen(request, timeout=20) as response:
+
+
+
+
+
+            return json.load(response)
+
+
+
+
+
+    except urllib.error.HTTPError as error:
+
+
+
+
+
+        try:
+
+
+
+
+
+            detail = json.loads(error.read())
+
+
+
+
+
+            message = detail.get("msg") or detail.get("message") or ""
+
+
+
+
+
+        except Exception:
+
+
+
+
+
+            message = ""
+
+
+
+
+
+        raise RuntimeError(message or f"서버 요청 실패 ({error.code})") from None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def session_token():
+
+
+
+
+
+    session = st.session_state.get("auth")
+
+
+
+
+
+    if not session:
+
+
+
+
+
+        return None
+
+
+
+
+
+    if session.get("expires_at", 0) < time.time() + 60:
+
+
+
+
+
+        session = api("/auth/v1/token?grant_type=refresh_token", "POST", {
+
+
+
+
+
+            "refresh_token": session["refresh_token"],
+
+
+
+
+
+        })
+
+
+
+
+
+        session.setdefault("expires_at", time.time() + session.get("expires_in", 3600))
+
+
+
+
+
+        st.session_state.auth = session
+
+
+
+
+
+    return session["access_token"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 BOARD_HTML = '<div id="operation-v2">\n<style>\n#operation-v2{color:var(--foreground);font-family:inherit}#operation-v2 section{margin-top:22px}#operation-v2 .fields{display:grid;grid-template-columns:minmax(140px,2fr) minmax(100px,1fr) minmax(125px,1fr);gap:12px}#operation-v2 .line{padding:12px 0;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:flex-start}#operation-v2 .grow{flex:1;min-width:0;overflow-wrap:anywhere}#operation-v2 .secondary{color:var(--muted-foreground)}#operation-v2 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}#operation-v2 .note{white-space:pre-wrap;overflow-wrap:anywhere}#operation-v2 .details{padding:14px 0}#operation-v2 .result{overflow-wrap:anywhere}#operation-v2 input[type=checkbox]{accent-color:var(--primary);width:18px;height:18px}#operation-v2 summary{padding:8px 0}#operation-v2 .head{display:flex;gap:12px;flex-wrap:wrap;align-items:center;padding-right:90px}@media(max-width:550px){#operation-v2 .fields{grid-template-columns:1fr}#operation-v2 .head{padding-right:0}}\n</style>\n<style>#operation-v2 .section-move{display:inline-block;width:115px}#operation-v2 .section-move select{max-width:100%}#operation-v2 [data-section-history]{max-width:100%}#operation-v2 [data-section-history][open]{flex-basis:100%}</style>\n<style>#operation-v2 .daily-grid{grid-template-columns:minmax(100px,1fr) 55px 55px 120px}#operation-v2 .daily-header>span:nth-child(2),#operation-v2 .daily-header>span:nth-child(3){text-align:center}#operation-v2 .progress-check{display:flex;justify-content:center;align-items:center}@media(max-width:450px){#operation-v2 .daily-grid{grid-template-columns:minmax(85px,1fr) 42px 42px 110px}}</style>\n<style>#operation-v2 .daily-grid{display:grid;grid-template-columns:minmax(100px,1fr) 55px 55px 120px;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)}#operation-v2 .daily-header{border-bottom:0}#operation-v2 .progress-check{text-align:center}#operation-v2 .daily-grid .inline-slot{grid-column:1/-1}@media(max-width:450px){#operation-v2 .daily-grid{grid-template-columns:minmax(85px,1fr) 42px 42px 110px;gap:4px}}</style>\n<style>#operation-v2 .manage-row{display:flex;align-items:center;gap:8px;flex-wrap:nowrap}#operation-v2 .manage-row .actions{display:contents}#operation-v2 .manage-row>*{flex-shrink:0}#operation-v2 .manage-row button{white-space:nowrap}#operation-v2 .date-cell{position:relative;display:inline-flex;align-items:center;min-width:52px;min-height:32px;white-space:nowrap}#operation-v2 .date-cell input{position:absolute;inset:0;width:100%;height:100%;opacity:0}#operation-v2 .date-cell:focus-within{outline:2px solid var(--ring)}#operation-v2 [data-item-row]>td{white-space:nowrap}#operation-v2 [data-inline-editor]>td{white-space:normal}#operation-v2 .title-cell{display:flex;align-items:center;gap:4px;min-width:360px}</style>\n<style>#operation-v2 .daily-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border)}#operation-v2 .inline-slot:empty{display:none}#operation-v2 .inline-slot{flex-basis:100%}#operation-v2 [hidden]{display:none!important}</style>\n<style>#operation-v2 .task-name{display:block;width:220px;flex:0 0 220px}#operation-v2 .manage-row{gap:4px}</style><div class="head"><strong id="date-label"></strong><button id="next-day" class="btn" type="button">다음 날 보기</button><button id="real-day" class="btn" type="button" hidden>오늘로</button><button id="news-toggle" class="btn" type="button">🔔 새 소식</button><button id="updates-toggle" class="collapse-toggle" type="button" aria-expanded="true" aria-controls="updates-group">▾ 업데이트 접기</button></div><div class="new-task-launch"><button id="top-add-toggle" class="btn btn-primary" type="button" aria-expanded="false" aria-controls="add-home-section">＋ 새 업무 추가</button></div><section id="add-home-section" hidden><details id="add-home"><summary hidden class="cursor-interaction new-task-toggle">＋ 새 업무 추가</summary><form id="add-form"><div class="fields"><label class="form-label">넣을 섹션<select id="task-section" class="form-select"></select></label><label id="new-section-label" class="form-label" hidden>새 섹션 이름<input id="task-new-section" class="form-control" maxlength="40" placeholder="예: 출시 준비"></label><label class="form-label">할 일<input id="task-title" required maxlength="100" class="form-control"></label><label class="form-label">담당<select id="task-owner" class="form-select"><option>미정</option><option>Hugo</option><option>제이나</option><option>함께</option></select></label><div class="new-task-priorities"><label class="form-label">마감일<input id="task-due" class="form-control" type="date"></label><label class="form-label">긴급도<select id="task-urgency" class="form-select"><option value="미정">● 미정</option><option value="낮음">🟢 낮음</option><option value="보통">🟡 보통</option><option value="높음">🔴 높음</option><option value="긴급">🚨 긴급</option></select></label><label class="form-label">중요도<select id="task-importance" class="form-select"><option value="미정">● 미정</option><option value="낮음">🟢 낮음</option><option value="보통">🟡 보통</option><option value="높음">🔴 높음</option><option value="매우 높음">🔴 매우 높음</option></select></label></div></div><div class="new-task-notes"><textarea id="task-note" hidden></textarea><div class="new-note-columns"><label class="form-label">메모<textarea id="task-feedback" class="form-control" rows="3" maxlength="1000" placeholder="상대방에게 부탁하거나 확인할 내용 (선택)"></textarea></label><div><textarea id="task-result" hidden></textarea><label class="form-label">결과물 링크<input id="task-link" class="form-control" type="url" maxlength="400" placeholder="https://..."></label><label class="form-label">이메일 제목<input id="task-email" class="form-control" maxlength="200"></label></div></div></div><div class="actions"><label class="form-check"><input id="task-week" class="form-check-input" type="checkbox"><span class="form-check-label">이번 주</span></label><label class="form-check"><input id="task-daily" class="form-check-input" type="checkbox"><span class="form-check-label">매일 반복</span></label><button class="btn btn-primary" type="submit">추가하기</button><button id="add-close" class="btn" type="button">닫기</button></div></form></details></section>\n<div class="profile-corner"><label for="my-emoji">내 이모지</label><select id="my-emoji" aria-label="내 이모지"></select><span id="my-profile"></span></div>\n<section id="news-panel" hidden><h3>새 소식</h3><div id="event-list"></div></section>\n<div id="notice" role="status" aria-live="polite"></div>\n<dialog id="help-dialog"><form id="help-form"><h3>🙋 손이 필요해요</h3><label>요청 종류<select id="help-kind"><option value="handoff">이번 주에 못 끝낼 것 같아요</option><option value="assist">같이 해주세요</option></select></label><label>이유 (선택)<textarea id="help-reason" maxlength="300" placeholder="비워두어도 요청할 수 있어요"></textarea></label><div class="actions"><button type="submit">요청하기</button><button type="button" id="help-close">취소</button></div></form></dialog><div id="updates-group"><section id="feedback-panel"><div class="viz-row" style="align-items:center"><h3 id="feedback-title">확인할 메모</h3><button id="feedback-toggle" class="collapse-toggle" type="button" aria-expanded="true" aria-controls="feedback-pending">▾ 접기</button></div><div id="feedback-pending"></div></section>\n<section id="review-panel" hidden><div class="viz-row" style="align-items:center"><h3 id="review-title">새 노트와 결과물 확인 필요</h3><button id="review-toggle" class="collapse-toggle" type="button" aria-expanded="true" aria-controls="review-list">▾ 접기</button></div><div id="review-list"></div></section>\n\n<section><div class="viz-row" style="align-items:center"><h3 id="new-title">오늘 새로 추가된 일</h3><button id="new-toggle" class="collapse-toggle" type="button" aria-expanded="true" aria-controls="new-content">▾ 접기</button></div><div id="new-content"><div id="new-list"></div><div id="added-dates" class="viz-row" aria-label="추가 날짜별 보기"></div></div></section>\n<hr>\n<section><div class="viz-row" style="align-items:center"><h3>Daily 할 일</h3><button id="daily-toggle" class="collapse-toggle" type="button" aria-expanded="true" aria-controls="daily-content">▾ 접기</button><button id="daily-add-toggle" type="button" aria-expanded="false" aria-controls="daily-add-form">＋ 추가</button></div><div id="daily-content"><form id="daily-add-form" hidden><div class="viz-row" style="align-items:center"><label class="form-label grow">매일 할 일<input id="daily-add-title" class="form-control" required maxlength="100" placeholder="매일 확인할 업무 이름"></label><button type="submit" class="btn btn-primary">Daily에 추가</button><button id="daily-add-close" type="button">닫기</button></div></form><div id="daily-list"></div></div></section>\n<hr>\n</div><section id="urgent-section" hidden><h3 id="urgent-title">🚨 긴급 업무</h3><div class="secondary text-small">긴급으로 지정한 업무를 가장 먼저 확인하세요.</div><div class="table-responsive"><table class="table table-sm focus-table"><thead><tr><th aria-label="업무 조작"></th><th><button type="button" class="sort-header" data-focus-sort="area" data-label="Section">Section ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="title" data-label="업무명">업무명 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="progress" data-label="진행률">진행률 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="support" data-label="지원">지원 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="urgency" data-label="긴급도">긴급도 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="importance" data-label="중요도">중요도 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="owner" data-label="담당">담당 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="start" data-label="시작일">시작일 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="due" data-label="마감">마감 ↕</button></th><th>관리</th></tr></thead><tbody id="urgent-list"></tbody></table></div></section><section id="weekly-section"><h3>우선 확인 · 이번 주에 끝낼 일</h3><div class="secondary text-small">긴급도 높음, 이번 주 마감, 또는 ‘이번 주’ 체크한 업무가 보여요. 긴급 업무는 바로 위에 따로 모았어요.</div><div class="table-responsive"><table class="table table-sm focus-table"><thead><tr><th aria-label="업무 조작"></th><th><button type="button" class="sort-header" data-focus-sort="area" data-label="Section">Section ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="title" data-label="업무명">업무명 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="progress" data-label="진행률">진행률 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="support" data-label="지원">지원 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="urgency" data-label="긴급도">긴급도 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="importance" data-label="중요도">중요도 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="owner" data-label="담당">담당 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="start" data-label="시작일">시작일 ↕</button></th><th><button type="button" class="sort-header" data-focus-sort="due" data-label="마감">마감 ↕</button></th><th>관리</th></tr></thead><tbody id="focus-list"></tbody></table></div></section><hr><section><h3 id="active-title">전체 업무표</h3><div class="table-responsive"><table class="table table-sm"><tbody id="active-list"></tbody></table></div></section>\n<section id="deadline-section"><h3>마감일순</h3><div class="secondary text-small">마감일이 가까운 업무부터 표시돼요. 지난 마감일은 맨 위에 표시됩니다.</div><div class="table-responsive"><table class="table table-sm"><thead><tr><th><button type="button" class="sort-header" data-deadline-sort="area" data-label="섹션">섹션 ↕</button></th><th><button type="button" class="sort-header" data-deadline-sort="title" data-label="업무">업무 ↕</button></th><th><button type="button" class="sort-header" data-deadline-sort="urgency" data-label="긴급도">긴급도 ↕</button></th><th><button type="button" class="sort-header" data-deadline-sort="importance" data-label="중요도">중요도 ↕</button></th><th><button type="button" class="sort-header" data-deadline-sort="owner" data-label="담당">담당 ↕</button></th><th><button type="button" class="sort-header" data-deadline-sort="start" data-label="시작일">시작일 ↕</button></th><th><button type="button" class="sort-header" data-deadline-sort="due" data-label="마감">마감 ↕</button></th><th>관리</th></tr></thead><tbody id="deadline-list"></tbody></table></div></section>\n<section id="orders-section"><hr><h3>진행 중 오더</h3><div id="orders-meta" class="secondary text-small"></div><div id="orders-summary" class="viz-row"></div><div id="orders-detail"></div></section>\n<section><details id="completed"><summary id="complete-title" class="cursor-interaction">완료함</summary><div id="complete-list"></div></details></section>\n<section><details><summary class="cursor-interaction">보관한 섹션</summary><div id="archived-sections"></div></details></section>\n<div id="deleted-list" hidden></div>\n<section id="editor" hidden><h3 id="edit-title">노트와 결과물</h3><div id="note-meta" class="message-meta secondary"></div><form id="edit-form"><div class="fields"><label class="form-label">담당<select id="edit-owner" class="form-select"><option>미정</option><option>Hugo</option><option>제이나</option><option>함께</option></select></label><label class="form-label">시작일<input id="edit-start" type="date" class="form-control"></label><label class="form-label">마감일<input id="edit-due" type="date" class="form-control"></label></div><textarea id="edit-note" hidden></textarea><div class="result-column"><textarea id="edit-result" hidden></textarea><label class="form-label">결과물 링크<input id="edit-link" type="url" maxlength="400" class="form-control" placeholder="https://..."></label><label class="form-label">이메일 제목<input id="edit-email" class="form-control" maxlength="200" placeholder="관련 이메일을 찾을 때 사용할 제목"></label><div class="actions"><button class="btn btn-primary" type="submit">저장</button><button class="btn" id="edit-close" type="button">닫기</button></div><div id="result-preview" class="result"></div></div></form><div class="feedback-column"><form id="task-feedback-form"><label class="form-label">메모<textarea id="task-feedback-text" maxlength="1000" rows="2" class="form-control" placeholder="진행 상황, 부탁할 일, 결정한 내용을 남겨주세요"></textarea></label><div class="actions"><label class="form-check reply-option"><input id="task-reply-required" type="checkbox"><span>답변 필요</span></label><button type="submit">메모 남기기</button></div></form><div id="task-feedback-list"></div></div></section>\n\n<section><details><summary class="cursor-interaction">Daily 체크 기록</summary><div id="daily-history"></div></details></section>\n</div>\n'
-
-BOARD_CSS = '\n:host{--foreground:#f5f5f5;--muted-foreground:#999;--border:#383838;--primary:#4285f4;--ring:#4285f4;--blue:#4285f4;--purple:#b278ed;--green:#43c67b;--orange:#f3a547;--red:#fa646b;--yellow:#dccc5a;font:14px system-ui,sans-serif;color:var(--foreground)}\n*{box-sizing:border-box}h2{font-size:22px;margin:0}h3{font-size:18px;margin:14px 0}button,input,select,textarea{font:inherit;color:inherit}button,summary{cursor:pointer}button{border:1px solid #505050;border-radius:8px;background:#303030;padding:5px 10px;white-space:nowrap}button:hover{background:#414141}button:disabled,input:disabled{opacity:.45;cursor:default}input:not([type=checkbox]),textarea,select{background:#303030;border:1px solid #505050;border-radius:8px;padding:6px 8px;max-width:100%}input[type=checkbox]{accent-color:var(--primary)}.form-control{width:100%}.form-label{display:block;margin:8px 0}.form-label>input,.form-label>select,.form-label>textarea{display:block;margin-top:5px}.btn-primary{background:#2761c6}.btn-ghost{border-color:transparent;background:transparent}.table-responsive{overflow-x:auto}.table{border-collapse:collapse;width:100%;margin-top:10px}.table th,.table td{text-align:left;padding:8px 4px;border-bottom:1px solid var(--border)}.table th{font-size:13px}.table th:first-child{min-width:370px}.table th:not(:first-child){white-space:nowrap}.table input[type=text]{width:100%}.viz-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}.text-small{font-size:12px}hr{border:0;border-top:1px solid var(--border);margin:26px 0}#notice{color:#9ac1ff;margin-top:10px}#operation-v2 .daily-grid{grid-template-columns:minmax(200px,1fr) repeat(var(--daily-columns,2),55px) 120px}#operation-v2 .section-move{width:100px}#operation-v2 .fields{gap:8px}#operation-v2 .head{padding-right:0}a{color:#8cbbff}details{margin-top:10px}summary{color:#c6c6c6}\n\n#deadline-section .table th:first-child{min-width:130px}#deadline-section .deadline-area{display:block;white-space:nowrap}#deadline-section .table th:nth-child(2){min-width:370px}.priority-dot{font-weight:600;min-width:82px}\n\n.order-card{min-width:90px;display:flex;flex-direction:column;gap:6px;text-align:left;padding:12px}.order-card strong{font-size:22px}#orders-section .order-table th:first-child{min-width:150px}#orders-section .order-table td{vertical-align:top}#orders-section .order-table td:nth-child(2){white-space:nowrap}#orders-section .order-table td:last-child{min-width:200px;max-width:340px;white-space:normal}\n\n.message-meta{display:flex;align-items:center;gap:8px;font-size:12px;white-space:nowrap;overflow-x:auto;margin:6px 0}.message-meta button{font-size:12px;padding:3px 7px}.details>.note{margin:6px 0 14px}\n\n#operation-v2 button.has-note{color:#72e3a1;border-color:#39845a;background:#173b29;font-weight:600}\n#operation-v2 button.has-note:hover{color:#a0f3bf;background:#205037}\n\n#operation-v2 #help-dialog{background:#242424;color:#eee;border:1px solid #666;border-radius:12px;width:min(440px,90vw)}\n#operation-v2 #help-dialog::backdrop{background:#0009}\n#operation-v2 #help-dialog label{display:block;margin:14px 0}\n#operation-v2 #help-dialog select,#operation-v2 #help-dialog textarea{display:block;width:100%;margin-top:6px}\n#operation-v2 .help-needed{color:#ffc478;font-size:12px}\n#operation-v2 .help-accepted{color:#72e3a1;font-size:12px}\n\n#operation-v2 .focus-area{display:block;box-sizing:border-box;flex:0 0 96px;width:96px;min-width:0;padding-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n#operation-v2 #focus-list .title-cell>.form-check{flex:0 0 auto;white-space:nowrap;margin:0}\n\n#operation-v2 #editor{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);column-gap:24px;align-items:start}\n#operation-v2 #edit-title,#operation-v2 #note-meta{grid-column:1/-1}\n#operation-v2 #edit-form{display:contents}\n#operation-v2 #edit-form>.fields,#operation-v2 #edit-form>label{grid-column:1/-1}\n#operation-v2 .result-column{grid-column:2;grid-row:5;min-width:0}\n#operation-v2 .feedback-column{grid-column:1;grid-row:5;min-width:0;border-right:1px solid var(--border);padding-right:24px}\n#operation-v2 .feedback-column h4{margin:0 0 12px}\n#operation-v2 .result-column textarea,#operation-v2 .feedback-column textarea{width:100%;box-sizing:border-box;min-height:100px}\n#operation-v2 .feedback-column .message-meta{white-space:normal;flex-wrap:wrap}\n@media(max-width:700px){#operation-v2 #editor{grid-template-columns:minmax(0,1fr)}#operation-v2 .feedback-column{grid-column:1;grid-row:5;border-right:0;padding-right:0}#operation-v2 .result-column{grid-column:1;grid-row:6;margin-top:20px}}\n\n#operation-v2 .title-cell>[data-help-request],#operation-v2 .title-cell>[data-help-accept],#operation-v2 .title-cell>[data-help-cancel]{flex:0 0 auto;white-space:nowrap;margin-left:4px}\n\n#operation-v2 .new-task-toggle{display:inline-block;padding:10px 16px;background:#275cba;color:#fff;border:1px solid #6999ee;border-radius:8px;font-weight:700;cursor:pointer;margin:8px 0 16px}\n#operation-v2 .new-task-toggle:hover{background:#3470d3}\n#operation-v2 .new-task-priorities{display:grid;grid-template-columns:180px 135px 145px;gap:12px;grid-column:1/-1;align-items:end}\n#operation-v2 .new-task-priorities input,#operation-v2 .new-task-priorities select{width:100%;box-sizing:border-box}\n@media(max-width:520px){#operation-v2 .new-task-priorities{grid-template-columns:minmax(130px,1.3fr) minmax(90px,1fr) minmax(90px,1fr);gap:6px}}\n\n#operation-v2 #focus-list .section-move{display:none}\n\n#operation-v2 .week-cell{text-align:center;width:52px;white-space:nowrap}\n#operation-v2 .week-cell .form-check{display:flex;justify-content:center;margin:0}\n#operation-v2 .help-cell{white-space:nowrap}\n\n#operation-v2 #focus-list .title-cell{min-width:0}\n#operation-v2 .sort-header{border:0;background:transparent;color:inherit;font-weight:700;padding:0;white-space:nowrap;cursor:pointer}\n#operation-v2 .sort-header:hover{color:#91baff}\n\n#operation-v2 .new-task-notes{margin:12px 0;width:100%}\n#operation-v2 .new-note-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px}\n#operation-v2 .new-task-notes textarea,#operation-v2 .new-task-notes input{width:100%;box-sizing:border-box}\n@media(max-width:700px){#operation-v2 .new-note-columns{grid-template-columns:1fr}}\n\n#operation-v2 .task-jump-link{background:none;border:0;padding:0;color:inherit;font-weight:700;text-align:left;cursor:pointer}\n#operation-v2 .task-jump-link:hover{text-decoration:underline;color:#90baff}\n#operation-v2 .jump-highlight{outline:2px solid #709ee8;outline-offset:-2px;background:#29426155}\n\n#operation-v2 .collapse-toggle{min-width:94px;min-height:36px;padding:7px 14px;margin-left:8px;background:#234b78;color:#e5f1ff;border:1px solid #72adf0;font-size:14px;font-weight:700;box-shadow:0 1px 3px #0004}\n#operation-v2 .collapse-toggle[aria-expanded="false"]{background:#2865b0;color:#fff;border-color:#99c9ff}\n#operation-v2 .collapse-toggle:hover{background:#3478c8;border-color:#bedfff}\n#operation-v2 .collapse-toggle:focus-visible{outline:3px solid #b4d8ff;outline-offset:3px}\n\n#operation-v2 #urgent-section{border:1px solid #b65058;border-left:5px solid #ff6868;border-radius:10px;background:#351c2080;padding:4px 14px 14px;margin-top:20px}\n#operation-v2 #urgent-title{color:#ff9ca2}\n#operation-v2 select.is-urgent{background:#69262e;color:#fff!important;border:2px solid #ff828b;font-weight:800}\n#operation-v2 #urgent-list .section-move{display:none}\n\n#operation-v2 .focus-table th:first-child,#operation-v2 .focus-table td:first-child{min-width:0;width:86px;white-space:nowrap}\n#operation-v2 .focus-table td:first-child .title-cell{min-width:0;width:max-content;gap:4px}\n\n#operation-v2 #new-list>.line{display:grid;grid-template-columns:94px minmax(0,1fr);gap:12px;align-items:center}\n#operation-v2 #new-list>.line>button{width:94px;text-align:center;align-self:center}\n#operation-v2 #new-list>.line>.grow{display:grid;grid-template-columns:minmax(0,1fr) 122px;column-gap:20px;align-items:center;min-width:0}\n#operation-v2 #new-list>.line>.grow>strong{grid-column:1;grid-row:1;overflow-wrap:anywhere}\n#operation-v2 #new-list>.line>.grow>.secondary{grid-column:1;grid-row:2}\n#operation-v2 #new-list>.line>.grow>.actions{grid-column:2;grid-row:1 / 3;margin:0;justify-content:flex-end}\n#operation-v2 #new-list #editor{grid-column:1 / -1;width:100%;margin-top:12px}\n@media(max-width:520px){#operation-v2 #new-list>.line{grid-template-columns:80px minmax(0,1fr);gap:8px}#operation-v2 #new-list>.line>button{width:80px;padding:5px 4px}#operation-v2 #new-list>.line>.grow{column-gap:8px;grid-template-columns:minmax(0,1fr) 110px}}\n\n#operation-v2 #review-list .grow{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:20px;align-items:center;width:100%}\n#operation-v2 #review-list .task-jump-link{grid-column:1;grid-row:1;justify-self:start}\n#operation-v2 #review-list .message-meta{grid-column:1;grid-row:2;flex-wrap:wrap;white-space:normal}\n#operation-v2 #review-list .grow>.actions{grid-column:2;grid-row:1 / 3;margin:0}\n#operation-v2 #review-list .details{grid-column:1 / -1;margin-top:12px}\n\n#operation-v2 .review-heading{grid-column:1;grid-row:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap}\n#operation-v2 .review-kind{font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;white-space:nowrap}\n#operation-v2 .review-note{background:#233e61;color:#a9d1ff}\n#operation-v2 .review-complete{background:#194c32;color:#8be5ad}\n\n#operation-v2 .task-progress{display:inline-flex;flex-direction:column;gap:3px;width:76px;min-width:76px;vertical-align:middle}\n#operation-v2 .task-progress select{width:76px;min-width:0;padding:4px 6px}\n#operation-v2 .task-progress progress{width:76px;height:5px;accent-color:#58d6a0;border:0;border-radius:4px;overflow:hidden}\n#operation-v2 .task-progress progress::-webkit-progress-bar{background:#39434c}\n#operation-v2 .task-progress progress::-webkit-progress-value{background:#58d6a0}\n\n#operation-v2 .profile-corner{position:fixed;top:5px;right:170px;z-index:1000000;display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:8px;background:var(--background,#171717);font-size:13px}\n#operation-v2 .profile-corner select{width:62px}\n#operation-v2 .new-task-launch{margin-top:14px}\n@media(max-width:650px){#operation-v2 .profile-corner{right:125px;gap:4px;padding:4px}#operation-v2 .profile-corner label{display:none}}\n\n#operation-v2 [data-drag-item],#operation-v2 [data-drag-section]{cursor:grab!important;touch-action:none}\n#operation-v2.dragging-task,#operation-v2.dragging-task *{cursor:grabbing!important}\n#operation-v2 .drag-source{opacity:.45}\n#operation-v2 .drop-before>td{box-shadow:inset 0 3px #69acff}\n#operation-v2 .drop-after>td{box-shadow:inset 0 -3px #69acff}\n\n/* One append-only memo composer alongside result references. */\n#operation-v2 #editor .feedback-column{grid-row:4}\n#operation-v2 #editor .result-column{grid-row:4}\n#operation-v2 #editor textarea[hidden],#operation-v2 #add-form textarea[hidden]{display:none!important}\n@media(max-width:700px){#operation-v2 #editor .result-column{grid-row:5}}\n\n#operation-v2 .reply-badge{display:inline-flex;align-items:center;padding:3px 7px;border:1px solid #e7b65a;border-radius:5px;background:#49391d;color:#ffdc90;font-size:12px;font-weight:700;white-space:nowrap}#operation-v2 .reply-badge.resolved{background:transparent;color:var(--muted-foreground);border-color:var(--border)}#operation-v2 .reply-option{display:inline-flex;align-items:center;gap:6px}\n\n/* Compact original layout, with user-adjustable column widths. */\n#operation-v2{font-size:13px}\n#operation-v2 section{margin-top:12px}\n#operation-v2 h2{font-size:16px;margin:6px 0}\n#operation-v2 h3{font-size:15px;margin:8px 0}\n#operation-v2 .line{padding:5px 0}\n#operation-v2 .daily-grid{padding:3px 0;min-height:28px}\n#operation-v2 .table td,#operation-v2 .table th{padding:3px 8px;height:28px;line-height:20px;vertical-align:middle}\n#operation-v2 .table button,#operation-v2 .table select,#operation-v2 .table input{min-height:24px;padding:2px 5px;font-size:12px}\n#operation-v2 .table .actions{margin-top:0}\n#operation-v2 .table-responsive{overflow:auto}\n#operation-v2 .user-resizable-table{table-layout:fixed;min-width:0}\n#operation-v2 .user-resizable-table td{overflow:hidden;text-overflow:ellipsis}\n#operation-v2 .resize-column{position:relative}\n#operation-v2 .column-resizer{position:absolute;top:0;right:-3px;bottom:0;width:7px;cursor:col-resize;z-index:4;touch-action:none}\n#operation-v2 .column-resizer:hover,#operation-v2 .column-resizer:focus{background:#4684a4;outline:none}\n#operation-v2 .user-resizable-table input,#operation-v2 .user-resizable-table select{max-width:100%;box-sizing:border-box}\n\n#operation-v2 .table-sort-label{border:0;background:transparent;color:inherit;padding:0 8px 0 0;text-align:left;cursor:pointer;white-space:nowrap}\n'
-
-BOARD_JS = '\nexport default function(component){\nconst {parentElement,data,setTriggerValue}=component;\nif(parentElement._operation?.root===parentElement.querySelector(\'#operation-v2\')){parentElement._operation.receive(data);return;}\nlet revision=data.revision,pending=null;\nconst actor=data.actor;\nconst people=data.members.map(x=>x.display_name);\nconst bridge={widgetState:{modelContent:{board:data.board}},setWidgetState(payload){\n  return new Promise((resolve,reject)=>{\n    const id=crypto.randomUUID();pending={id,resolve,reject};\n    setTriggerValue(\'change\',{id,revision,board:payload.modelContent.board,message:payload.modelContent.board.events[0]?.text||\'업무판을 업데이트했어요\'});\n  });\n}};\n\nconst root=parentElement.querySelector(\'#operation-v2\'),q=id=>root.querySelector(\'#\'+id);\nconst editorNode=q(\'editor\');\nq(\'active-list\').closest(\'section\').before(q(\'deadline-section\'));\n\nconst noteDrafts=new Map(),feedbackDrafts=new Map(),replyDrafts=new Map(),openReviews=new Set();\nlet addedDay=null,addSection=null,editBase=null,orderStatus=null,editLocation=null;\nfunction editorLocation(button){const history=button?.closest(\'[data-section-history]\');return history?\'[data-section-history="\'+CSS.escape(history.dataset.sectionHistory)+\'"]\':button?.closest(\'[id]\')?.id?\'#\'+CSS.escape(button.closest(\'[id]\').id):null;}\nconst addForm=q(\'add-form\'),addHome=addForm.parentElement;\nfunction mountAdd(){addHome.append(addForm);root.querySelectorAll(\'[data-inline-add]\').forEach(x=>x.remove());if(!addSection)return;const header=Array.from(root.querySelectorAll(\'[data-section]\')).find(x=>x.dataset.section===addSection);if(!header){addSection=null;return;}const row=document.createElement(\'tr\');row.dataset.inlineAdd=addSection;const cell=document.createElement(\'td\');cell.colSpan=7;cell.style.whiteSpace=\'normal\';row.append(cell);header.after(row);cell.append(addForm);q(\'add-close\').hidden=false;}\nfunction mountEditor(){if(!editId||editorNode.hidden)return;const button=(editLocation?root.querySelector(editLocation+\' [data-edit="\'+CSS.escape(editId)+\'"]\'):null)||root.querySelector(\'[data-item-row="\'+editId+\'"] [data-edit]\')||root.querySelector(\'[data-edit="\'+editId+\'"]\');if(!button)return;const row=button.closest(\'tr\');if(row){const next=document.createElement(\'tr\');next.dataset.inlineEditor=\'true\';const cell=document.createElement(\'td\');cell.colSpan=row.children.length;next.append(cell);row.after(next);cell.append(editorNode);}else{const daily=button.closest(\'.daily-grid\');if(daily)daily.querySelector(\'.inline-slot\').append(editorNode);else button.closest(\'.grow\').append(editorNode);}}\nconst day=()=>new Intl.DateTimeFormat(\'sv-SE\',{timeZone:\'America/New_York\',year:\'numeric\',month:\'2-digit\',day:\'2-digit\'}).format(new Date());\nconst plus=(d,n)=>{const x=new Date(d+\'T12:00:00Z\');x.setUTCDate(x.getUTCDate()+n);return x.toISOString().slice(0,10);};\nconst read=s=>s?.modelContent?.board;const valid=x=>x?.version===2&&Array.isArray(x.items)&&Array.isArray(x.events);\nlet state=structuredClone(data.board),viewDay=day(),editId=null,saving=false,dirtyEditor=false,seen=new Set(state.events.map(x=>x.id));\nlet drag=null;\nconst completions=new Set();\nlet completing=false;\nfunction completeNow(id){\n  if(data.readOnly||completions.has(id))return;\n  completions.add(id);render();notify(\'완료 처리 중…\');flushCompletions();\n}\nasync function flushCompletions(){\n  if(completing||!completions.size)return;\n  if(saving){setTimeout(flushCompletions,60);return;}\n  completing=true;\n  const ids=[...completions];\n  const ok=await mutate(()=>{for(const id of ids){const item=find(id);if(item){item.status=\'complete\';item.doneDate=day();item.needsReview=true;item.reviewKind=\'complete\';item.completedBy=actor.display_name;item.completedTime=new Date().toISOString();item.completionReadBy=[];}}},ids.length===1?(find(ids[0])?.title||\'업무\')+\' 완료했어요\':ids.length+\'개 업무를 완료했어요\');\n  ids.forEach(id=>completions.delete(id));completing=false;render();\n  if(!ok)notify(\'완료 저장에 실패해 업무를 다시 표시했어요. 다시 시도해주세요.\');\n  flushCompletions();\n}\nconst emojiChoices=[\'\',\'🙂\',\'😎\',\'😊\',\'🐻\',\'🐱\',\'🐶\',\'🦊\',\'🐼\',\'🐰\',\'🦁\',\'🐯\',\'🐸\',\'🐧\',\'🦉\',\'🌻\',\'🌷\',\'🍀\',\'⭐\',\'🌙\',\'🔥\',\'🚀\',\'💎\',\'🎯\'];\nfunction personLabel(name){if(name===\'함께\')return \'🙋 함께\';const key=name===\'제이나\'?\'Jayna\':name;const emoji=state.memberEmoji?.[key];return (emojiChoices.includes(emoji)&&emoji?emoji+\' \':\'\')+name;}\nfunction shortTime(value){if(!value)return \'시간 미기록\';if(value.length===10)return value.slice(5).replace(\'-\',\'/\');const d=new Date(value);if(Number.isNaN(d.getTime()))return \'시간 미기록\';const p=new Intl.DateTimeFormat(\'en-US\',{timeZone:\'America/New_York\',month:\'2-digit\',day:\'2-digit\',hour:\'2-digit\',minute:\'2-digit\',hour12:false}).formatToParts(d);const get=t=>p.find(x=>x.type===t)?.value;return get(\'month\')+\'/\'+get(\'day\')+\' \'+get(\'hour\')+\':\'+get(\'minute\');}\nfunction cleanNote(value){return String(value||\'\').replace(/^화면\\s*기록\\s*[:：]\\s*/, \'\');}\nfunction reviewActor(x){return x.reviewKind===\'complete\'?x.completedBy:x.noteUpdatedBy;}\nfunction reviewMeta(x){return x.reviewKind===\'complete\'?personLabel(x.completedBy||\'작성자 미기록\')+\' · \'+shortTime(x.completedTime||x.doneDate)+\' · 확인: \'+((x.completionReadBy||[]).map(personLabel).join(\', \')||\'대기\'):noteMeta(x);}\nfunction noteMeta(x){return (x.noteUpdatedBy?personLabel(x.noteUpdatedBy):\'작성자 미기록\')+\' · \'+shortTime(x.noteUpdatedTime||x.noteUpdatedAt)+\' · 확인: \'+((x.noteReadBy||[]).map(personLabel).join(\', \')||\'대기\');}\nlet helpTaskId=null;\nfunction helpControls(x,allowRequest=false){const h=x.helpRequest;if(h?.status===\'pending\')return \'<span class="help-needed">🟠 도움 필요</span> \'+(h.by===actor.display_name?\'<button type="button" data-help-cancel="\'+esc(x.id)+\'">요청 취소</button>\':\'<button type="button" data-help-accept="\'+esc(x.id)+\'">🙋 내가 할게요</button>\');if(h?.status===\'accepted\')return \'<span class="help-accepted">🙋 \'+esc(personLabel(h.acceptedBy))+\' · \'+(h.kind===\'assist\'?\'함께 돕는 중\':\'맡았어요\')+\'</span>\';return allowRequest?\'<button type="button" data-help-request="\'+esc(x.id)+\'">🙋 손이 필요해요</button>\':\'\';}\nfunction offerControls(x){const o=x.helpOffer;if(o?.status===\'accepted\')return \'<span class="help-accepted">🤚 \'+esc(personLabel(o.by))+\' 함께 돕는 중</span>\';if(o?.status===\'pending\')return o.by===actor.display_name?\'<span>제안 대기</span><button type="button" data-offer-cancel="\'+esc(x.id)+\'">제안 취소</button>\':\'<button type="button" data-offer-accept="\'+esc(x.id)+\'">같이 해주세요</button>\';return \'<button type="button" data-offer="\'+esc(x.id)+\'">🤚 손이 필요해요?</button>\';}\nfunction bindHelp(){\n root.querySelectorAll(\'[data-offer]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.offer);if(x.helpOffer?.status===\'pending\')throw new Error(\'이미 제안 중이에요.\');x.helpOffer={status:\'pending\',by:actor.display_name,at:new Date().toISOString()};},\'🤚 \'+actor.display_name+\'님이 도움을 제안했어요\');});\n root.querySelectorAll(\'[data-offer-cancel]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const o=find(b.dataset.offerCancel).helpOffer;if(o?.by===actor.display_name)o.status=\'cancelled\';},\'도움 제안을 취소했어요\');});\n root.querySelectorAll(\'[data-offer-accept]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.offerAccept),o=x.helpOffer;if(o?.status!==\'pending\'||o.by===actor.display_name)throw new Error(\'상대방이 수락해야 해요.\');o.status=\'accepted\';o.acceptedBy=actor.display_name;o.acceptedAt=new Date().toISOString();state.comments=state.comments||[];state.comments.unshift({id:crypto.randomUUID(),taskId:x.id,author:actor.display_name,text:\'🤚 \'+o.by+\'님, 같이 해주세요. 도움 제안을 수락했어요.\',at:o.acceptedAt,readBy:[actor.display_name]});},\'도움 제안을 수락했어요\');});\n root.querySelectorAll(\'[data-help-request]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>{helpTaskId=b.dataset.helpRequest;q(\'help-kind\').value=\'handoff\';q(\'help-reason\').value=\'\';q(\'help-dialog\').showModal();};});\n root.querySelectorAll(\'[data-help-cancel]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.helpCancel);if(x.helpRequest?.by===actor.display_name)x.helpRequest.status=\'cancelled\';},\'도움 요청을 취소했어요\');});\n root.querySelectorAll(\'[data-help-accept]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.helpAccept),h=x.helpRequest;if(h?.status!==\'pending\'||h.by===actor.display_name)throw new Error(\'이미 처리된 요청이에요.\');h.status=\'accepted\';h.acceptedBy=actor.display_name;h.acceptedAt=new Date().toISOString();if(h.kind===\'handoff\')x.owner=actor.display_name===\'Jayna\'?\'제이나\':actor.display_name;state.comments=state.comments||[];state.comments.unshift({id:crypto.randomUUID(),taskId:x.id,author:actor.display_name,text:h.kind===\'assist\'?\'🙋 함께 도와줄게요.\':\'🙋 제가 맡아서 할게요.\',at:h.acceptedAt,readBy:[actor.display_name]});},\'🙋 \'+actor.display_name+\'님이 도움 요청을 맡았어요\');});\n}\nfunction taskJumpLink(x){return \'<button type="button" class="task-jump-link" data-task-jump="\'+esc(x.id)+\'">\'+esc(title(x))+\'</button>\';}\nfunction jumpToTask(id){const x=find(id);if(!x)return;let target=root.querySelector(\'#active-list [data-item-row="\'+CSS.escape(id)+\'"]\');if(!target){const b=root.querySelector(\'#active-list [data-edit="\'+CSS.escape(id)+\'"]\')||root.querySelector(\'#complete-list [data-edit="\'+CSS.escape(id)+\'"]\')||root.querySelector(\'#daily-list [data-edit="\'+CSS.escape(id)+\'"]\');target=b?.closest(\'.line,.daily-grid,tr\');}if(!target){const b=Array.from(root.querySelectorAll(\'[data-unarchive]\')).find(b=>b.dataset.unarchive===(x.area||\'미분류\'));target=b?.closest(\'.line\');}if(!target){notify(\'현재 목록에서 이 업무를 찾을 수 없어요.\');return;}for(let p=target.parentElement;p&&p!==root;p=p.parentElement)if(p.tagName===\'DETAILS\')p.open=true;target.scrollIntoView({behavior:\'smooth\',block:\'center\'});target.classList.remove(\'jump-highlight\');void target.offsetWidth;target.classList.add(\'jump-highlight\');setTimeout(()=>target.classList.remove(\'jump-highlight\'),2200);}\nfunction needsReply(c){return !!c.replyRequired&&!c.replyResolvedAt&&!c.deletedAt;}\nfunction toggleReply(c){if(needsReply(c)){c.replyResolvedAt=new Date().toISOString();c.replyResolvedBy=actor.display_name;c.readBy=[...new Set([...(c.readBy||[]),actor.display_name])];}else{c.replyRequired=true;c.replyResolvedAt=null;c.replyResolvedBy=null;}}\nfunction replyCount(id){return (state.comments||[]).filter(c=>c.taskId===id&&needsReply(c)).length;}\nfunction feedbackRow(c,showTaskLink=true){\n const item=find(c.taskId),unread=c.author!==actor.display_name&&!(c.readBy||[]).includes(actor.display_name),readers=(c.readBy||[]).filter(n=>n!==c.author);\n return \'<div class="line"><div class="grow"><div class="message-meta"><span>\'+esc(personLabel(c.author))+\' · \'+esc(shortTime(c.at))+\' · 확인: \'+esc(readers.map(personLabel).join(\', \')||(c.author===actor.display_name?\'상대방 확인 대기\':\'대기\'))+\'</span>\'+(c.replyRequired?\'<span class="reply-badge \'+(needsReply(c)?\'\':\'resolved\')+\'">\'+(needsReply(c)?\'답변 필요\':\'답변 완료\')+\'</span><button type="button" data-reply-toggle="\'+esc(c.id)+\'">\'+(needsReply(c)?\'답변 완료\':\'다시 답변 요청\')+\'</button>\':(c.author===actor.display_name?\'<button type="button" data-reply-toggle="\'+esc(c.id)+\'">답변 필요 표시</button>\':\'\'))+(c.author===actor.display_name?\'<button type="button" data-feedback-delete="\'+esc(c.id)+\'">삭제</button>\':\'\')+(unread?\'<button type="button" data-feedback-read="\'+esc(c.id)+\'">확인했어요</button>\':\'\')+\'</div><div class="secondary text-small">\'+(item&&showTaskLink?taskJumpLink(item):esc(item?title(item):\'전체 메모\'))+\'</div><div class="note">\'+esc(c.text)+\'</div>\'+(item&&showTaskLink?\'<div class="actions"><button type="button" data-feedback-task="\'+esc(item.id)+\'">업무 열기 / 답글</button></div>\':\'\')+\'</div></div>\';\n}\nfunction renderFeedback(){\n if(editId)q(\'note-meta\').textContent=noteMeta(find(editId)||{});const comments=(state.comments||[]).filter(c=>!c.deletedAt),pending=comments.filter(c=>needsReply(c)||(c.author===actor.display_name?!(c.readBy||[]).some(n=>n!==c.author):!(c.readBy||[]).includes(actor.display_name)));\n const offerItems=state.items.filter(x=>x.status===\'active\'&&x.helpOffer?.status===\'pending\');const helpItems=state.items.filter(x=>x.status===\'active\'&&x.helpRequest?.status===\'pending\');q(\'feedback-title\').textContent=\'확인할 메모 · \'+(pending.length+helpItems.length+offerItems.length);\n q(\'feedback-pending\').innerHTML=offerItems.map(x=>\'<div class="line"><div class="grow">\'+taskJumpLink(x)+\'<div class="message-meta">\'+esc(personLabel(x.helpOffer.by))+\' · \'+esc(shortTime(x.helpOffer.at))+\' · 🤚 손이 필요해요?</div><div class="actions">\'+offerControls(x)+\'</div></div></div>\').join(\'\')+helpItems.map(x=>\'<div class="line"><div class="grow">\'+taskJumpLink(x)+\'<div class="message-meta">\'+esc(personLabel(x.helpRequest.by))+\' · \'+esc(shortTime(x.helpRequest.at))+\' · \'+(x.helpRequest.kind===\'assist\'?\'같이 해주세요\':\'이번 주에 못 끝낼 것 같아요\')+\'</div>\'+(x.helpRequest.reason?\'<div class="note">\'+esc(x.helpRequest.reason)+\'</div>\':\'\')+\'<div class="actions">\'+helpControls(x)+\'</div></div></div>\').join(\'\')+pending.map(c=>feedbackRow(c)).join(\'\')||\'<div class="secondary text-small">새로 확인할 메모가 없어요. 전체 의견은 왼쪽 ‘메모·피드백’에서 남겨주세요.</div>\';\n const legacy=find(editId),legacyText=[cleanNote(legacy?.note),legacy?.result].filter(Boolean).join(\'\\n\\n\');\n q(\'task-feedback-list\').innerHTML=(legacyText?\'<div class="line"><div class="grow"><div class="message-meta">기존 메모 · \'+esc(noteMeta(legacy))+\'</div><div class="note">\'+esc(legacyText)+\'</div></div></div>\':\'\')+comments.filter(c=>c.taskId===editId).slice().reverse().map(c=>feedbackRow(c,false)).join(\'\')||\'<div class="secondary text-small">아직 남긴 메모가 없어요.</div>\';\n root.querySelectorAll(\'[data-task-jump]\').forEach(b=>b.onclick=()=>jumpToTask(b.dataset.taskJump));\n root.querySelectorAll(\'[data-feedback-delete]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>{const c=state.comments.find(c=>c.id===b.dataset.feedbackDelete);if(!c||c.author!==actor.display_name||!confirm(\'이 피드백을 삭제할까요?\'))return;mutate(()=>{const target=state.comments.find(x=>x.id===c.id);if(target.author!==actor.display_name)throw new Error(\'본인 글만 삭제할 수 있어요.\');target.deletedAt=new Date().toISOString();},\'본인 피드백을 삭제했어요\');};});\n root.querySelectorAll(\'[data-reply-toggle]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const c=state.comments.find(c=>c.id===b.dataset.replyToggle);if(!c||c.deletedAt)return;toggleReply(c);},\'답변 상태를 저장했어요\');});\n root.querySelectorAll(\'[data-feedback-read]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const c=state.comments.find(c=>c.id===b.dataset.feedbackRead);c.readBy=[...new Set([...(c.readBy||[]),actor.display_name])];},\'메모를 확인했어요\');});\n root.querySelectorAll(\'[data-feedback-task]\').forEach(b=>b.onclick=()=>{if(editId===b.dataset.feedbackTask&&!editorNode.hidden){q(\'task-feedback-text\').focus({preventScroll:false});return;}openEdit(b.dataset.feedbackTask);if(editId===b.dataset.feedbackTask)q(\'task-feedback-text\').focus({preventScroll:false});});\n}\nfunction renderOrders(){\n const summary=state.orderSummary;\n if(!summary){q(\'orders-meta\').textContent=\'원본 엑셀을 불러오면 상태별 진행 건수가 표시돼요.\';q(\'orders-summary\').innerHTML=\'\';q(\'orders-detail\').innerHTML=\'\';return;}\n const orders=summary.orders||[],statuses=[...new Set([\'PENDING\',\'PLANNED\',\'SUBMITTED\',\'CONFIRMED\',\'SHIPPED\',...orders.map(x=>x.status)])];\n const checked=new Date(summary.checkedAt),stale=Date.now()-checked.getTime()>36*60*60*1000;\n const stamp=Number.isNaN(checked.getTime())?\'확인 시각 없음\':checked.toLocaleString(\'ko-KR\',{timeZone:\'America/New_York\',month:\'2-digit\',day:\'2-digit\',hour:\'2-digit\',minute:\'2-digit\',hour12:false});\n const link=safeLink(summary.sourceUrl);\n q(\'orders-meta\').innerHTML=esc(\'원본 확인 \'+stamp+\' (뉴욕) · SENT / 취소 제외\')+(stale?\' <strong style="color:var(--orange)">최신 확인 필요</strong>\':\'\')+(link?\' · <a href="\'+esc(link)+\'" target="_blank" rel="noopener noreferrer">원본 엑셀 ↗</a>\':\'\');\n const cards=[[\'전체\',orders.length],...statuses.map(s=>[s,orders.filter(x=>x.status===s).length])];\n q(\'orders-summary\').innerHTML=cards.map(([s,n])=>\'<button type="button" class="order-card" data-order-status="\'+esc(s)+\'" aria-expanded="\'+(orderStatus===s)+\'" style="\'+(orderStatus===s?\'border-color:var(--blue)\':\'\')+\'"><span>\'+esc(s)+\'</span><strong>\'+n+\'건</strong></button>\').join(\'\');\n const list=orderStatus===\'전체\'?orders:orders.filter(x=>x.status===orderStatus);\n const money=n=>n===null||n===undefined?\'미정\':\'$\'+Number(n).toLocaleString(\'en-US\',{minimumFractionDigits:2,maximumFractionDigits:2});\n q(\'orders-detail\').innerHTML=orderStatus?\'<h4>\'+esc(orderStatus)+\' · \'+list.length+\'건</h4><div class="table-responsive"><table class="table order-table"><thead><tr><th>회사</th><th>금액</th><th>PO / SO</th><th>출고 예정</th><th>출고지</th><th>상태 / 메모</th></tr></thead><tbody>\'+list.map(x=>\'<tr><td>\'+esc(x.customer)+\'</td><td>\'+esc(money(x.amount))+\'</td><td>\'+esc(x.po)+\'<div class="secondary text-small">SO \'+esc(x.so||\'미정\')+\'</div></td><td>\'+esc(x.readyDate?x.readyDate.slice(5).replace(\'-\',\'/\'):\'미정\')+\'</td><td>\'+esc(x.shipFrom)+\'</td><td>\'+esc(x.status)+\'<div class="secondary text-small">\'+esc(x.note)+\'</div></td></tr>\').join(\'\')+(list.length?\'\':\'<tr><td colspan="6">해당 상태의 오더가 없어요.</td></tr>\')+\'</tbody></table></div>\':\'\';\n root.querySelectorAll(\'[data-order-status]\').forEach(b=>b.onclick=()=>{orderStatus=orderStatus===b.dataset.orderStatus?null:b.dataset.orderStatus;renderOrders();});\n}\nfunction sections(){return [...new Set([...(state.sections||[]),...state.items.map(x=>x.area||\'미분류\')])];}\nfunction visibleSections(){return sections().filter(x=>!(state.archivedSections||[]).includes(x));}\nfunction sectionColor(name){if(state.sectionColors?.[name])return state.sectionColors[name];const palette=[\'--blue\',\'--purple\',\'--green\',\'--orange\',\'--red\',\'--yellow\'];let hash=0;for(const c of name)hash=(hash*31+c.charCodeAt(0))>>>0;return palette[hash%palette.length];}\nfunction moveItem(id,area,before){const x=find(id);if(!x)return;const i=state.items.indexOf(x);state.items.splice(i,1);x.area=area;const target=before?state.items.findIndex(y=>y.id===before):-1;if(target>=0)state.items.splice(target,0,x);else{let last=-1;state.items.forEach((y,i)=>{if((y.area||\'미분류\')===area)last=i;});state.items.splice(last<0?state.items.length:last+1,0,x);}}\nconst esc=x=>String(x??\'\').replace(/[&<>"\']/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\nconst notify=s=>q(\'notice\').textContent=s;\nconst title=x=>[x.area,x.title].filter(Boolean).join(\' · \');\nconst safeLink=s=>{try{const u=new URL(s);return [\'https:\',\'http:\'].includes(u.protocol)?u.href:\'\';}catch{return \'\';}};\nconst bytes=x=>new TextEncoder().encode(JSON.stringify(x)).length;\nfunction event(text){state.events.unshift({id:crypto.randomUUID(),text,date:day()});state.events=state.events.slice(0,100);}\nfunction snapshot(){return structuredClone(state);}\nasync function mutate(fn,text){if(data.readOnly){notify(\'미리보기에서는 저장되지 않습니다.\');render();return false;}if(saving){notify(\'저장 중이에요. 잠시 후 다시 눌러주세요.\');return false;}const remote=read(bridge?.widgetState);if(valid(remote))state=structuredClone(remote);const before=structuredClone(state);fn();event(text);const payload={modelContent:{board:snapshot()}};if(!bridge?.setWidgetState){state=before;notify(\'공유 저장에 연결되지 않아 변경하지 않았어요.\');render();return false;}saving=true;render();try{await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));await bridge.setWidgetState(payload);notify(\'저장했어요\');return true;}catch(error){state=structuredClone(read(bridge.widgetState)||before);notify(error.message||\'저장 실패. 다시 시도해주세요.\');return false;}finally{saving=false;render();}}\nconst find=id=>state.items.find(x=>x.id===id);\nfunction sectionHistory(area){const list=state.items.filter(x=>(x.area||\'미분류\')===area&&[\'complete\',\'deleted\'].includes(x.status));return \'<details data-section-history="\'+esc(area)+\'"><summary class="cursor-interaction">완료 기록 (\'+list.length+\')</summary>\'+list.map(x=>\'<div class="line"><div class="grow">\'+esc(x.title)+\'<span class="secondary text-small"> · \'+\'완료\'+\'</span><div class="actions"><button class="btn" data-edit="\'+esc(x.id)+\'" type="button">노트 / 결과물</button><button class="btn" data-reactivate="\'+esc(x.id)+\'" type="button">다시 올리기</button></div></div></div>\').join(\'\')+(list.length?\'\':\'<div class="secondary">아직 기록이 없어요.</div>\')+\'</details>\';}\nlet focusSort={key:null,direction:1};\nlet deadlineSort={key:"due",direction:1};\nfunction sortFocus(items,sort=focusSort){if(!sort.key)return items;const {key,direction}=sort;const rank={\'낮음\':1,\'보통\':2,\'높음\':3,\'긴급\':4,\'매우 높음\':4};const value=x=>key===\'progress\'?(Number(x.progress)||0):key===\'week\'?Number(x.weekGoal===weekStart()):key===\'support\'?(x.helpRequest?.status===\'pending\'?2:x.helpOffer?.status===\'pending\'?1:0):key===\'urgency\'||key===\'importance\'?rank[x[key]]:key===\'owner\'?(x.owner===\'미정\'?\'\':x.owner===\'제이나\'?\'Jayna\':x.owner):x[key];return items.map((x,i)=>({x,i})).sort((a,b)=>{const av=value(a.x),bv=value(b.x),am=av===undefined||av===null||av===\'\',bm=bv===undefined||bv===null||bv===\'\';if(am!==bm)return am?1:-1;const cmp=typeof av===\'number\'&&typeof bv===\'number\'?av-bv:String(av||\'\').localeCompare(String(bv||\'\'),\'ko\',{numeric:true});return cmp*direction||a.i-b.i;}).map(v=>v.x);}\nfunction bindDeadlineSort(){root.querySelectorAll(\'[data-deadline-sort]\').forEach(b=>{const active=deadlineSort.key===b.dataset.deadlineSort;b.textContent=b.dataset.label+(active?(deadlineSort.direction===1?\' ↑\':\' ↓\'):\' ↕\');b.closest(\'th\').setAttribute(\'aria-sort\',active?(deadlineSort.direction===1?\'ascending\':\'descending\'):\'none\');b.onclick=()=>{deadlineSort={key:b.dataset.deadlineSort,direction:active?-deadlineSort.direction:1};render();};});}\nfunction bindFocusSort(){root.querySelectorAll(\'[data-focus-sort]\').forEach(b=>{const active=focusSort.key===b.dataset.focusSort;b.textContent=b.dataset.label+(active?(focusSort.direction===1?\' ↑\':\' ↓\'):\' ↕\');b.closest(\'th\').setAttribute(\'aria-sort\',active?(focusSort.direction===1?\'ascending\':\'descending\'):\'none\');b.onclick=()=>{focusSort={key:b.dataset.focusSort,direction:active?-focusSort.direction:1};render();};});}\nfunction weekStart(date=viewDay){const d=new Date(date+\'T12:00:00Z\');return plus(date,-((d.getUTCDay()+6)%7));}\nfunction progressCell(x){const n=Math.max(0,Math.min(100,Number(x.progress)||0));return \'<span class="task-progress" title="\'+esc(x.progressUpdatedBy?personLabel(x.progressUpdatedBy)+\' · \'+shortTime(x.progressUpdatedAt):\'진행률을 선택해주세요\')+\'"><select class="form-select" data-progress-id="\'+esc(x.id)+\'" aria-label="\'+esc(x.title)+\' 진행률">\'+[0,10,30,50,70,90,100].map(v=>\'<option value="\'+v+\'" \'+(v===n?\'selected\':\'\')+\'>\'+v+\'%</option>\').join(\'\')+\'</select><progress max="100" value="\'+n+\'" aria-label="진행률 \'+n+\'%"></progress></span>\';}\nfunction taskRow(x,area,showArea=false,inlineArea=false){return \'<tr data-item-row="\'+esc(x.id)+\'" data-item-area="\'+esc(area)+\'">\'+(showArea?\'<td><span class="deadline-area" style="border-left:4px solid var(\'+sectionColor(area)+\');padding-left:8px">\'+esc(area)+\'</span></td>\':\'\')+\'<td><div class="title-cell"><button class="btn btn-ghost" data-delete="\'+esc(x.id)+\'" type="button">완료</button><button class="btn btn-ghost" draggable="true" data-drag-item="\'+esc(x.id)+\'" type="button" aria-label="\'+esc(x.title)+\' 업무 이동">↕</button>\'+(inlineArea?\'</div></td><td><span class="focus-area" title="\'+esc(area)+\'" style="border-left:4px solid var(\'+sectionColor(area)+\')">\'+esc(area)+\'</span></td><td><div class="title-cell">\':\'\')+\'<span class="task-name"><input class="form-control" data-title-id="\'+esc(x.id)+\'" value="\'+esc(x.title)+\'" maxlength="100" aria-label="업무 이름 수정"></span>\'+(inlineArea?\'</div></td><td>\':\'\')+progressCell(x)+(inlineArea?\'</td><td class="help-cell">\':\'\')+helpControls(x,inlineArea)+(inlineArea?\' \'+offerControls(x):\'\')+(inlineArea?\'</td>\':\'</div></td>\')+\'<td>\'+priorityCell(x,\'urgency\')+\'</td><td>\'+priorityCell(x,\'importance\')+\'</td><td><select class="form-select" data-owner-id="\'+esc(x.id)+\'" aria-label="담당자">\'+[\'미정\',\'Hugo\',\'제이나\',\'함께\'].map(a=>\'<option value="\'+esc(a)+\'" \'+(a===x.owner?\'selected\':\'\')+\'>\'+esc(personLabel(a))+\'</option>\').join(\'\')+\'</select></td><td>\'+dateCell(x,\'start\')+\'</td><td>\'+dateCell(x,\'due\')+\'</td><td><div class="manage-row">\'+buttons(x)+\'<span class="section-move"><select class="form-select" aria-label="섹션 이동" data-area-id="\'+esc(x.id)+\'">\'+visibleSections().map(a=>\'<option \'+(a===area?\'selected\':\'\')+\'>\'+esc(a)+\'</option>\').join(\'\')+\'</select></span></div></td></tr>\';}\nfunction dateCell(x,key){const date=x[key]||\'\';return \'<div class="date-edit"><button type="button" class="btn btn-ghost" data-date-open="\'+esc(x.id)+\'" data-date-key="\'+key+\'" aria-label="\'+esc(x.title)+\' \'+(key===\'start\'?\'시작일\':\'마감일\')+\' 더블클릭해서 수정">\'+esc(date?date.slice(5).replace(\'-\',\'/\'):\'미정\')+\'</button><input hidden type="date" class="form-control" data-date="\'+key+\'" data-date-id="\'+esc(x.id)+\'" value="\'+esc(date)+\'" aria-label="\'+esc(x.title)+\' \'+(key===\'start\'?\'시작일\':\'마감일\')+\'"></div>\';}\nfunction priorityCell(x,key){const options=key===\'urgency\'?[\'미정\',\'낮음\',\'보통\',\'높음\',\'긴급\']:[\'미정\',\'낮음\',\'보통\',\'높음\',\'매우 높음\'];const value=x[key]||\'미정\';const color={\'미정\':\'#999\',\'낮음\':\'#43c67b\',\'보통\':\'#e6c94c\',\'높음\':\'#ff6868\',\'긴급\':\'#ff6868\',\'매우 높음\':\'#ff6868\'};return \'<select class="form-select priority-dot \'+(key===\'urgency\'&&value===\'긴급\'?\'is-urgent\':\'\')+\'" style="color:\'+color[value]+\'" data-priority="\'+key+\'" data-priority-id="\'+esc(x.id)+\'" aria-label="\'+esc(x.title)+\' \'+(key===\'urgency\'?\'긴급도\':\'중요도\')+\'">\'+options.map(a=>\'<option value="\'+a+\'" style="color:\'+color[a]+\'" \'+(a===value?\'selected\':\'\')+\'>\'+ (a===\'긴급\'?\'🚨 \':\'● \')+a+\'</option>\').join(\'\')+\'</select>\';}\n\nfunction buttons(x){const count=replyCount(x.id);return \'<div class="actions">\'+(count?\'<span class="reply-badge" title="메모를 열어 답변이 필요한 내용을 확인하세요">답변 필요 \'+count+\'</span>\':\'\')+\'<button class="btn" data-edit="\'+esc(x.id)+\'" type="button">노트 / 결과물\'+(x.note||x.result||x.link?\' •\':\'\')+\'</button></div>\';}\nfunction short(x){return \'<div class="line"><button class="btn btn-ghost" \'+(x.status===\'complete\'?\'data-reactivate\':\'data-delete\')+\'="\'+esc(x.id)+\'" type="button">\'+(x.status===\'complete\'?\'다시 올리기\':\'완료\')+\'</button><div class="grow"><strong>\'+esc(title(x))+\'</strong><div class="secondary text-small">담당 \'+esc(personLabel(x.owner))+\' · \'+(x.doneDate?\'완료 \'+esc(x.doneDate):\'등록 \'+esc(x.added))+\'</div>\'+buttons(x)+\'</div></div>\';}\nfunction openEdit(id,source=null){const location=source?editorLocation(source):editLocation;if(editId===id&&!editorNode.hidden&&source&&location!==editLocation){editLocation=location;root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());mountEditor();return;}if(editId===id&&!editorNode.hidden){if(dirtyEditor)noteDrafts.set(id,{_base:editBase,owner:q(\'edit-owner\').value,start:q(\'edit-start\').value,due:q(\'edit-due\').value,note:q(\'edit-note\').value,result:q(\'edit-result\').value,link:q(\'edit-link\').value,emailSubject:q(\'edit-email\').value});editorNode.hidden=true;root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());editId=null;dirtyEditor=false;return;}if(dirtyEditor){if(editId!==id)notify(\'작성 중인 노트를 저장하거나 닫은 뒤 다른 업무를 열어주세요.\');return;}const original=find(id);if(!original)return;editLocation=location;editBase=structuredClone(noteDrafts.get(id)?._base||original);const x={...original,...(noteDrafts.get(id)||{})};root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());editId=id;dirtyEditor=noteDrafts.has(id);editorNode.hidden=false;q(\'edit-title\').textContent=\'노트 / 결과물\';q(\'edit-owner\').value=x.owner;q(\'edit-start\').value=x.start||\'\';q(\'edit-due\').value=x.due||\'\';q(\'edit-note\').value=cleanNote(x.note);q(\'edit-result\').value=x.result||\'\';q(\'edit-link\').value=x.link||\'\';q(\'edit-email\').value=x.emailSubject||\'\';const link=safeLink(x.link);q(\'result-preview\').innerHTML=link?\'<a href="\'+esc(link)+\'" target="_blank" rel="noopener noreferrer">결과물 열기 ↗</a>\':\'\';renderFeedback();q(\'task-feedback-text\').value=feedbackDrafts.get(id)||\'\';q(\'task-reply-required\').checked=!!replyDrafts.get(id);mountEditor();q(\'task-feedback-text\').focus({preventScroll:true});}\n\nconst tableWidths=new Map();\nconst tableSorts=new Map();\n\nfunction bindTableSorting(){\n root.querySelectorAll(\'table\').forEach((table,index)=>{\n  const tableKey=table.querySelector(\'tbody\')?.id||\'table-\'+index;\n  const headers=Array.from(table.querySelectorAll(\'thead tr,.section-column-labels\'));\n  headers.forEach((header,sectionIndex)=>{\n   if(header.querySelector(\'[data-focus-sort],[data-deadline-sort]\'))return;\n   const key=tableKey+\'-\'+sectionIndex;\n   const cells=Array.from(header.children);\n   function value(row,column){\n    const cell=row.children[column];if(!cell)return \'\';\n    const input=cell.querySelector(\'[data-title-id],[data-progress-id],[data-owner-id],[data-date],input,select\');\n    const raw=input?.value??cell.textContent.trim();\n    if(input?.matches(\'[data-progress-id]\'))return Number(raw)||0;\n    return raw.trim();\n   }\n   function apply(){\n    const sort=tableSorts.get(key);if(!sort)return;\n    const rows=[];\n    let row=header.nextElementSibling;\n    while(row&&!row.hasAttribute(\'data-section\')&&!row.classList.contains(\'section-column-labels\')){\n     const next=row.nextElementSibling;\n     if(row.hasAttribute(\'data-item-row\'))rows.push(row);\n     row=next;\n    }\n    if(!rows.length&&header.parentElement.tagName===\'THEAD\'){\n     rows.push(...table.querySelectorAll(\'tbody>[data-item-row]\'));\n    }\n    rows.sort((a,b)=>{\n     const av=value(a,sort.column),bv=value(b,sort.column);\n     return (typeof av===\'number\'&&typeof bv===\'number\'?av-bv:String(av).localeCompare(String(bv),\'ko\',{numeric:true,sensitivity:\'base\'}))*sort.direction;\n    });\n    const container=rows[0]?.parentElement;if(!container)return;\n    const anchor=row;\n    for(const current of rows)container.insertBefore(current,anchor?.parentElement===container?anchor:null);\n    cells.forEach((cell,column)=>cell.setAttribute(\'aria-sort\',column===sort.column?(sort.direction===1?\'ascending\':\'descending\'):\'none\'));\n   }\n   cells.forEach((cell,column)=>{\n    if(cell.querySelector(\'.table-sort-label\'))return;\n    const text=cell.textContent.trim();if(!text||text===\'관리\')return;\n    const label=document.createElement(\'button\');label.type=\'button\';label.className=\'table-sort-label\';label.textContent=text+\' ↕\';\n    Array.from(cell.childNodes).filter(n=>!n.classList?.contains(\'column-resizer\')).forEach(n=>n.remove());\n    cell.prepend(label);\n    label.onclick=()=>{const old=tableSorts.get(key);const direction=old?.column===column?-old.direction:1;tableSorts.set(key,{column,direction});apply();cells.forEach((c,i)=>{const b=c.querySelector(\'.table-sort-label\');if(b)b.textContent=b.textContent.replace(/ [↕↑↓]$/,\'\')+(i===column?(direction===1?\' ↑\':\' ↓\'):\' ↕\');});};\n   });\n   apply();\n  });\n });\n}\n\nfunction resizeTables(){\n root.querySelectorAll(\'table\').forEach((table,index)=>{\n  const key=table.querySelector(\'tbody\')?.id||\'table-\'+index;\n  const heads=table.querySelector(\'tr\')?.children;\n  if(!heads||!heads.length)return;\n  // Sectioned tables have a spanning heading before their column labels.\n  const header=Array.from(table.querySelectorAll(\'tr\')).find(row=>row.children.length>1);\n  if(!header)return;\n  const cells=Array.from(header.children);\n  const saved=tableWidths.get(key);\n  let cols=table.querySelector(\'colgroup[data-resizable]\');\n  if(!cols){cols=document.createElement(\'colgroup\');cols.dataset.resizable=\'true\';cells.forEach((cell,i)=>{const col=document.createElement(\'col\');col.style.width=(saved?.[i]||Math.max(64,cell.getBoundingClientRect().width))+\'px\';cols.append(col)});table.prepend(cols);}\n  table.classList.add(\'user-resizable-table\');\n  if(saved)Array.from(cols.children).forEach((col,i)=>{if(saved[i])col.style.width=saved[i]+\'px\'});\n  cells.forEach((cell,i)=>{\n   cell.classList.add(\'resize-column\');\n   if(cell.querySelector(\'.column-resizer\'))return;\n   const handle=document.createElement(\'span\');handle.className=\'column-resizer\';handle.tabIndex=0;handle.role=\'separator\';handle.setAttribute(\'aria-orientation\',\'vertical\');handle.setAttribute(\'aria-label\',(cell.textContent.trim()||\'열\')+\' 폭 조절\');\n   const store=()=>tableWidths.set(key,Array.from(cols.children).map(c=>parseFloat(c.style.width)));\n   function change(width){cols.children[i].style.width=Math.max(60,width)+\'px\';table.style.width=Array.from(cols.children).reduce((sum,col)=>sum+parseFloat(col.style.width),0)+\'px\';store();}\n   handle.onpointerdown=e=>{\n    if(e.button!==0)return;e.preventDefault();e.stopPropagation();\n    const x=e.clientX,width=parseFloat(cols.children[i].style.width);\n    handle.setPointerCapture(e.pointerId);\n    handle.onpointermove=move=>change(width+move.clientX-x);\n    const end=()=>{handle.onpointermove=null;handle.onpointerup=null;handle.onpointercancel=null;};\n    handle.onpointerup=end;handle.onpointercancel=end;\n   };\n   handle.onclick=e=>e.stopPropagation();\n   handle.onkeydown=e=>{if(e.key===\'ArrowLeft\'||e.key===\'ArrowRight\'){e.preventDefault();e.stopPropagation();change(parseFloat(cols.children[i].style.width)+(e.key===\'ArrowRight\'?10:-10));}};\n   cell.append(handle);\n  });\n });\n}\n\nfunction render(){renderOrders();renderFeedback();q(\'my-profile\').textContent=personLabel(actor.display_name);q(\'my-emoji\').innerHTML=emojiChoices.map(e=>\'<option value="\'+e+\'" \'+(e===(state.memberEmoji?.[actor.display_name]||\'\')?\'selected\':\'\')+\'>\'+(e||\'없음\')+\'</option>\').join(\'\');q(\'my-emoji\').disabled=saving||data.readOnly;for(const id of [\'task-owner\',\'edit-owner\'])for(const option of q(id).options){const name=option.getAttribute(\'value\')||option.textContent;option.value=name;option.textContent=personLabel(name);}addHome.append(addForm);root.querySelectorAll(\'[data-inline-add]\').forEach(x=>x.remove());root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());q(\'date-label\').textContent=viewDay+(viewDay===day()?\' · 오늘\':\' · 미리보기\');q(\'real-day\').hidden=viewDay===day();const selectedAddedDay=addedDay||day();q(\'new-title\').textContent=selectedAddedDay.slice(5).replace(\'-\',\'/\')+(selectedAddedDay===day()?\' 오늘 새로 추가된 일\':\' 추가된 일\');const dates=[...new Set([day(),...Array.from({length:7},(_,i)=>plus(day(),-i)),...state.items.filter(x=>!x.imported).map(x=>x.added)])].filter(Boolean).sort((a,b)=>b.localeCompare(a));q(\'added-dates\').innerHTML=dates.map(d=>\'<button class="btn btn-ghost" type="button" data-added-day="\'+esc(d)+\'" aria-pressed="\'+(d===selectedAddedDay)+\'">\'+esc(d.slice(5).replace(\'-\',\'/\'))+(d===day()?\' 오늘\':\'\')+\'</button>\').join(\'\');root.querySelectorAll(\'[data-added-day]\').forEach(b=>b.onclick=()=>{addedDay=b.dataset.addedDay;render();});\nconst chosen=q(\'task-section\').value; q(\'task-section\').innerHTML=visibleSections().map(a=>\'<option value="\'+esc(a)+\'">\'+esc(a)+\'</option>\').join(\'\')+\'<option value="__new__">＋ 새 섹션 만들기</option>\';q(\'task-section\').value=(chosen===\'__new__\'||visibleSections().includes(chosen))?chosen:\'미분류\';q(\'new-section-label\').hidden=q(\'task-section\').value!==\'__new__\';\nconst fresh=state.items.filter(x=>!completions.has(x.id)&&!x.imported&&x.added===selectedAddedDay);q(\'new-list\').innerHTML=fresh.map(short).join(\'\')||\'<div class="secondary">이 날짜에 새로 추가한 일이 없어요.</div>\';\nconst daily=state.items.filter(x=>x.daily&&x.added<=viewDay&&x.status===\'active\'&&!completions.has(x.id));q(\'daily-list\').innerHTML=\'<div class="daily-grid daily-header"><span class="secondary text-small">내 계정으로 체크하면 내 이름과 색깔로 표시됩니다.</span>\'+people.map(p=>\'<span>\'+esc(personLabel(p))+\'</span>\').join(\'\')+\'<span></span></div>\'+daily.map(x=>\'<div class="daily-grid"><span><button class="btn btn-ghost" data-delete="\'+esc(x.id)+\'" type="button">완료</button> \'+esc(x.title)+\'</span>\'+people.map(person=>\'<label class="progress-check"><input class="cursor-interaction" type="checkbox" data-daily="\'+esc(x.id)+\'" data-person="\'+person+\'" aria-label="\'+esc(x.title)+\' \'+person+\' 진행 중" \'+(x.checks?.[viewDay]?.people?.[person]?\'checked\':\'\')+\'></label>\').join(\'\')+\'<button class="btn btn-ghost" data-edit="\'+esc(x.id)+\'" type="button">노트 / 결과물</button><div class="inline-slot grow"></div></div>\').join(\'\');\nconst active=state.items.filter(x=>!x.daily&&x.status===\'active\'&&!completions.has(x.id)&&(x.imported||x.added<=viewDay));q(\'active-title\').textContent=\'전체 업무표 · \'+active.length;\nconst focus=state.items.filter(x=>!x.daily&&x.status===\'active\'&&!completions.has(x.id)&&visibleSections().includes(x.area||\'미분류\')&&([\'높음\',\'긴급\'].includes(x.urgency)||(x.due&&x.due<=plus(weekStart(),6))||x.weekGoal===weekStart()));const urgent=focus.filter(x=>x.urgency===\'긴급\');q(\'urgent-section\').hidden=urgent.length===0;q(\'urgent-title\').textContent=\'🚨 긴급 업무 · \'+urgent.length;q(\'urgent-list\').innerHTML=sortFocus(urgent).map(x=>taskRow(x,x.area||\'미분류\',false,true)).join(\'\')||\'<tr><td colspan="11" class="secondary">현재 긴급으로 지정된 업무가 없어요.</td></tr>\';q(\'focus-list\').innerHTML=sortFocus(focus.filter(x=>x.urgency!==\'긴급\')).map(x=>taskRow(x,x.area||\'미분류\',false,true)).join(\'\')||\'<tr><td colspan="11" class="secondary">업무의 ‘이번 주’를 체크하거나 긴급도·마감일을 지정해주세요.</td></tr>\';\nconst deadlines=state.items.filter(x=>!x.daily&&x.status===\'active\'&&!completions.has(x.id)&&x.due&&visibleSections().includes(x.area||\'미분류\')).sort((a,b)=>a.due.localeCompare(b.due)||a.title.localeCompare(b.title));q(\'deadline-list\').innerHTML=sortFocus(deadlines,deadlineSort).map(x=>taskRow(x,x.area||\'미분류\',true)).join(\'\')||\'<tr><td colspan="8" class="secondary">마감일을 지정한 업무가 여기에 표시됩니다.</td></tr>\';\nq(\'active-list\').innerHTML=visibleSections().map(area=>\'<tr data-section="\'+esc(area)+\'"><td colspan="7"><div class="viz-row"><h2 style="border-left:6px solid var(\'+sectionColor(area)+\');padding-left:12px">\'+esc(area)+\'</h2><button class="btn" data-add-section="\'+esc(area)+\'" type="button">＋ 새 업무</button><button class="btn btn-ghost" draggable="true" data-drag-section="\'+esc(area)+\'" type="button" aria-label="\'+esc(area)+\' 섹션 순서 이동">↕</button><span class="secondary text-small">\'+active.filter(x=>(x.area||\'미분류\')===area).length+\'개</span><button class="btn btn-ghost" data-section-up="\'+esc(area)+\'" type="button" aria-label="\'+esc(area)+\' 섹션 위로">↑</button><button class="btn btn-ghost" data-section-down="\'+esc(area)+\'" type="button" aria-label="\'+esc(area)+\' 섹션 아래로">↓</button><button class="btn" data-rename="\'+esc(area)+\'" type="button">이름 수정</button><button class="btn btn-ghost" data-archive-section="\'+esc(area)+\'" type="button">Archive</button>\'+sectionHistory(area)+\'</div><form data-rename-form="\'+esc(area)+\'" class="viz-row" hidden><label class="form-label">섹션 이름<input class="form-control" maxlength="40" required value="\'+esc(area)+\'"></label><button class="btn" type="submit">저장</button></form></td></tr><tr class="section-column-labels"><th>업무</th><th>긴급도</th><th>중요도</th><th>담당</th><th>시작일</th><th>마감</th><th>관리</th></tr>\'+active.filter(x=>(x.area||\'미분류\')===area).map(x=>taskRow(x,area)).join(\'\')).join(\'\');\nconst complete=state.items.filter(x=>x.status===\'complete\');q(\'complete-title\').textContent=\'완료함 · \'+complete.length;q(\'complete-list\').innerHTML=complete.map(short).join(\'\')||\'<div class="secondary">완료한 업무가 여기에 모여요.</div>\';\nq(\'deleted-list\').innerHTML=\'\';\nq(\'event-list\').innerHTML=state.events.map(x=>\'<div class="line"><div>\'+esc(x.text)+\'<div class="secondary text-small">\'+esc(x.date)+\' · \'+esc(x.actor||\'이전 기록\')+\'</div></div></div>\').join(\'\')||\'<div class="secondary">새로 추가하거나 완료하면 기록이 남아요.</div>\';q(\'news-toggle\').textContent=\'🔔 새 소식 \'+state.events.length;\nq(\'daily-history\').innerHTML=state.items.filter(x=>x.daily).flatMap(x=>Object.entries(x.checks||{}).sort(([a],[b])=>b.localeCompare(a)).map(([d,c])=>\'<div class="line">\'+esc(d)+\' · \'+esc(x.title)+\' · \'+esc(c.people?Object.keys(c.people).join(\', \')||\'진행 표시 해제\':\'이전 체크 기록\')+\'</div>\')).join(\'\')||\'<div class="secondary">Daily 진행 기록이 없어요.</div>\';\nroot.querySelectorAll(\'[data-edit]\').forEach(b=>{const x=find(b.dataset.edit);const hasContent=x&&([x.note,x.result,x.link,x.emailSubject].some(v=>String(v||\'\').trim())||(state.comments||[]).some(c=>!c.deletedAt&&c.taskId===x.id&&c.text?.trim()));b.classList.toggle(\'has-note\',!!hasContent);b.textContent=\'노트 / 결과물\'+(hasContent?\' •\':\'\');b.onclick=()=>openEdit(b.dataset.edit,b);});\nroot.querySelectorAll(\'[data-progress-id]\').forEach(b=>b.onchange=()=>{const id=b.dataset.progressId,n=Number(b.value);if(![0,10,30,50,70,90,100].includes(n))return;mutate(()=>{Object.assign(find(id),{progress:n,progressUpdatedBy:actor.display_name,progressUpdatedAt:new Date().toISOString()});},find(id).title+\' 진행률 \'+n+\'%\');});\nroot.querySelectorAll(\'[data-reactivate]\').forEach(b=>b.onclick=()=>mutate(()=>{const item=find(b.dataset.reactivate);item.status=\'active\';item.doneDate=\'\';if(item.reviewKind===\'complete\'){item.needsReview=false;item.reviewKind=\'note\';}},find(b.dataset.reactivate).title+\' 다시 올렸어요\'));\nconst pending=state.items.filter(x=>x.needsReview&&x.status!==\'deleted\');q(\'review-panel\').hidden=!pending.length;q(\'review-title\').textContent=\'업데이트 확인 필요 · \'+pending.length;\nq(\'review-list\').innerHTML=pending.map(x=>{const expanded=openReviews.has(x.id),link=safeLink(x.link);return \'<div class="line"><div class="grow">\'+\'<div class="review-heading"><span class="review-kind \'+(x.reviewKind===\'complete\'?\'review-complete\':\'review-note\')+\'">\'+(x.reviewKind===\'complete\'?\'✅ 업무 완료\':\'📝 새 노트\')+\'</span>\'+taskJumpLink(x)+\'</div>\'+ \'<div class="message-meta"><span>\'+esc(reviewMeta(x))+\'</span>\'+(reviewActor(x)===actor.display_name?\'<span class="secondary">상대방 확인 대기</span>\':\'\')+\'</div><div class="actions">\'+(reviewActor(x)===actor.display_name?\'\':\'<button class="btn" data-reviewed="\'+esc(x.id)+\'" type="button">확인했어요</button>\')+\'<button class="btn" data-review-open="\'+esc(x.id)+\'" type="button" aria-expanded="\'+expanded+\'">\'+(expanded?\'내용 닫기\':\'내용 보기\')+\'</button></div>\'+(expanded?\'<div class="details" data-review-content="\'+esc(x.id)+\'"><strong>진행 상황과 노트</strong><div class="note">\'+esc(cleanNote(x.note)||\'작성된 노트가 없어요.\')+\'</div><strong>결과물 메모</strong><div class="note">\'+esc(x.result||\'작성된 결과물 메모가 없어요.\')+\'</div>\'+(link?\'<p><a href="\'+esc(link)+\'" target="_blank" rel="noopener noreferrer">결과물 링크 열기 ↗</a></p>\':\'\')+(x.emailSubject?\'<strong>이메일 제목</strong><div class="note">\'+esc(x.emailSubject)+\'</div>\':\'\')+\'</div>\':\'\')+\'</div></div>\';}).join(\'\');q(\'review-list\').querySelectorAll(\'[data-task-jump]\').forEach(b=>b.onclick=()=>jumpToTask(b.dataset.taskJump));\nroot.querySelectorAll(\'[data-review-open]\').forEach(b=>b.onclick=()=>{const id=b.dataset.reviewOpen;if(openReviews.has(id))openReviews.delete(id);else openReviews.add(id);render();});\nroot.querySelectorAll(\'[data-reviewed]\').forEach(b=>b.onclick=()=>mutate(()=>{if(reviewActor(find(b.dataset.reviewed))===actor.display_name)throw new Error(\'상대방이 확인해야 합니다.\');find(b.dataset.reviewed).needsReview=false;find(b.dataset.reviewed).reviewedAt=day();const item=find(b.dataset.reviewed),field=item.reviewKind===\'complete\'?\'completionReadBy\':\'noteReadBy\';item[field]=[...new Set([...(item[field]||[]),actor.display_name])];},find(b.dataset.reviewed).title+\' 업데이트를 확인했어요\'));\nq(\'archived-sections\').innerHTML=(state.archivedSections||[]).map(area=>\'<div class="line"><div class="grow">\'+esc(area)+\' · \'+state.items.filter(x=>(x.area||\'미분류\')===area&&x.status===\'active\'&&!completions.has(x.id)).length+\'개</div><button class="btn" data-unarchive="\'+esc(area)+\'" type="button">꺼내기</button></div>\').join(\'\')||\'<div class="secondary">보관한 섹션이 없어요.</div>\';\nroot.querySelectorAll(\'[data-archive-section]\').forEach(b=>b.onclick=()=>mutate(()=>{state.archivedSections=[...new Set([...(state.archivedSections||[]),b.dataset.archiveSection])];},b.dataset.archiveSection+\' 섹션을 보관했어요\'));\nroot.querySelectorAll(\'[data-unarchive]\').forEach(b=>b.onclick=()=>mutate(()=>{state.archivedSections=(state.archivedSections||[]).filter(x=>x!==b.dataset.unarchive);},b.dataset.unarchive+\' 섹션을 꺼냈어요\'));\nroot.querySelectorAll(\'[data-status]\').forEach(b=>b.onclick=async()=>{const id=b.dataset.status;const x=find(id);await mutate(()=>{const item=find(id);item.status=item.status===\'complete\'?\'active\':\'complete\';item.doneDate=item.status===\'complete\'?day():\'\';},title(x)+(x.status===\'complete\'?\' 다시 열었어요\':\' 완료했어요\'));});\nroot.querySelectorAll(\'[data-delete]\').forEach(b=>b.onclick=()=>completeNow(b.dataset.delete));\nroot.querySelectorAll(\'[data-restore]\').forEach(b=>b.onclick=async()=>{const id=b.dataset.restore,x=find(id);await mutate(()=>{const item=find(id);item.status=item.previousStatus||\'active\';},title(x)+\' 복원했어요\');});\nroot.querySelectorAll(\'[data-daily]\').forEach(b=>b.onchange=async()=>{const id=b.dataset.daily,on=b.checked,person=b.dataset.person,x=find(id);await mutate(()=>{const item=find(id);item.checks=item.checks||{};const c=item.checks[viewDay]||{date:viewDay};c.people=c.people||{};if(on)c.people[person]=true;else delete c.people[person];item.checks[viewDay]=c;},title(x)+\' \'+person+(on?\' 진행 중으로 표시했어요\':\' 진행 표시를 해제했어요\'));});\nroot.querySelectorAll(\'[data-date]\').forEach(b=>b.onchange=async()=>{const value=b.value,id=b.dataset.dateId,key=b.dataset.date;await mutate(()=>{find(id)[key]=value;},find(id).title+\' \'+(key===\'start\'?\'시작일\':\'마감일\')+\'을 바꿨어요\');});\nroot.querySelectorAll(\'[data-date-open]\').forEach(b=>{b.ondblclick=()=>{const input=b.parentElement.querySelector(\'input\');b.hidden=true;input.hidden=false;input.focus();try{input.showPicker();}catch{}};});\nroot.querySelectorAll(\'[data-week-id]\').forEach(b=>b.onchange=async()=>{const id=b.dataset.weekId,on=b.checked;await mutate(()=>{find(id).weekGoal=on?weekStart():\'\';},find(id).title+(on?\' 이번 주 목표로 표시했어요\':\' 이번 주 목표를 해제했어요\'));});\nroot.querySelectorAll(\'[data-priority]\').forEach(b=>b.onchange=async()=>{const id=b.dataset.priorityId,key=b.dataset.priority,value=b.value;await mutate(()=>{find(id)[key]=value;},find(id).title+\' \'+(key===\'urgency\'?\'긴급도\':\'중요도\')+\'를 \'+value+\'로 바꿨어요\');});\nroot.querySelectorAll(\'[data-title-id]\').forEach(b=>b.onchange=async()=>{const value=b.value.trim(),id=b.dataset.titleId;if(!value){b.value=find(id).title;return;}await mutate(()=>{find(id).title=value;},\'업무 이름을 \'+value+\'으로 바꿨어요\');});\nroot.querySelectorAll(\'[data-owner-id]\').forEach(b=>b.onchange=async()=>{const value=b.value,id=b.dataset.ownerId;await mutate(()=>{find(id).owner=value;},find(id).title+\' 담당을 \'+value+\'로 바꿨어요\');});\nroot.querySelectorAll(\'[data-area-id]\').forEach(b=>b.onchange=async()=>{const area=b.value,id=b.dataset.areaId;await mutate(()=>moveItem(id,area),find(id).title+\'을 \'+area+\' 섹션으로 옮겼어요\');});\nroot.querySelectorAll(\'[data-add-section]\').forEach(b=>b.onclick=()=>{const area=b.dataset.addSection;addSection=addSection===area?null:area;q(\'task-section\').value=area;q(\'new-section-label\').hidden=true;q(\'task-new-section\').required=false;q(\'task-daily\').checked=false;mountAdd();q(\'add-close\').hidden=false;if(addSection)q(\'task-title\').focus({preventScroll:true});});\nroot.querySelectorAll(\'[data-rename]\').forEach(b=>b.onclick=()=>{const form=Array.from(root.querySelectorAll(\'[data-rename-form]\')).find(x=>x.dataset.renameForm===b.dataset.rename);form.hidden=!form.hidden;if(!form.hidden)form.querySelector(\'input\').focus();});\nroot.querySelectorAll(\'[data-rename-form]\').forEach(form=>form.onsubmit=async e=>{e.preventDefault();const old=form.dataset.renameForm,name=form.querySelector(\'input\').value.trim();if(!name||name===old){form.hidden=true;return;}if(sections().includes(name)){notify(\'같은 이름의 섹션이 있어요.\');return;}await mutate(()=>{const color=sectionColor(old);state.sectionColors=state.sectionColors||{};state.sectionColors[name]=color;delete state.sectionColors[old];state.sections=sections().map(x=>x===old?name:x);state.items.forEach(x=>{if((x.area||\'미분류\')===old)x.area=name;});},old+\' 섹션 이름을 \'+name+\'으로 바꿨어요\');});\nfunction clearDrag(){drag=null;root.classList.remove(\'dragging-task\');root.querySelectorAll(\'.drop-before,.drop-after,.drag-source\').forEach(el=>el.classList.remove(\'drop-before\',\'drop-after\',\'drag-source\'));}\nroot.querySelectorAll(\'[data-drag-item],[data-drag-section]\').forEach(b=>{b.ondragstart=e=>{if(dirtyEditor||saving){e.preventDefault();notify(\'저장이 끝난 뒤 이동해주세요.\');return;}drag=b.dataset.dragItem?{type:\'item\',id:b.dataset.dragItem,body:b.closest(\'tbody\'),ids:[...b.closest(\'tbody\').querySelectorAll(\'[data-item-row]\')].map(r=>r.dataset.itemRow)}:{type:\'section\',area:b.dataset.dragSection};root.classList.add(\'dragging-task\');b.closest(\'tr\')?.classList.add(\'drag-source\');e.dataTransfer.setData(\'text/plain\',b.dataset.dragItem||b.dataset.dragSection);e.dataTransfer.effectAllowed=\'move\';};b.ondragend=clearDrag;});\nroot.querySelectorAll(\'[data-section],[data-item-row]\').forEach(b=>{b.ondragover=e=>{if(!drag)return;if(drag.type===\'item\'&&(!b.dataset.itemRow||b.closest(\'tbody\')!==drag.body))return;e.preventDefault();e.dataTransfer.dropEffect=\'move\';root.querySelectorAll(\'.drop-before,.drop-after\').forEach(el=>el.classList.remove(\'drop-before\',\'drop-after\'));b.classList.add(e.clientY>b.getBoundingClientRect().top+b.getBoundingClientRect().height/2?\'drop-after\':\'drop-before\');};b.ondrop=async e=>{e.preventDefault();if(!drag)return;const d=drag,after=e.clientY>b.getBoundingClientRect().top+b.getBoundingClientRect().height/2;clearDrag();const area=b.dataset.section||b.dataset.itemArea;if(d.type===\'section\'){await mutate(()=>{const list=sections();const from=list.indexOf(d.area),to=list.indexOf(area);if(from<0||to<0||from===to)return;list.splice(from,1);list.splice(list.indexOf(area),0,d.area);state.sections=list;},\'섹션 순서를 바꿨어요\');}else if(b.dataset.itemRow&&d.id!==b.dataset.itemRow&&b.closest(\'tbody\')===d.body){const ids=d.ids.filter(id=>id!==d.id);ids.splice(ids.indexOf(b.dataset.itemRow)+(after?1:0),0,d.id);if([\'focus-list\',\'urgent-list\'].includes(d.body.id))focusSort={key:null,direction:1};if(d.body.id===\'deadline-list\')deadlineSort={key:null,direction:1};await mutate(()=>{const ordered=ids.map(find).filter(Boolean),set=new Set(ids);let i=0;state.items=state.items.map(item=>set.has(item.id)?ordered[i++]:item);},\'업무 순서를 바꿨어요\');}};});\nfor(const [attr,delta] of [[\'sectionUp\',-1],[\'sectionDown\',1]])root.querySelectorAll(\'[data-\'+(delta<0?\'section-up\':\'section-down\')+\']\').forEach(b=>b.onclick=()=>mutate(()=>{const list=sections(),i=list.indexOf(b.dataset[attr]),j=i+delta;if(j>=0&&j<list.length){[list[i],list[j]]=[list[j],list[i]];state.sections=list;}},\'섹션 순서를 바꿨어요\'));\nfor(const [attr,delta] of [[\'itemUp\',-1],[\'itemDown\',1]])root.querySelectorAll(\'[data-\'+(delta<0?\'item-up\':\'item-down\')+\']\').forEach(b=>b.onclick=()=>mutate(()=>{const id=b.dataset[attr],x=find(id),list=state.items.filter(y=>y.status===\'active\'&&!y.daily&&(y.area||\'미분류\')===(x.area||\'미분류\')),i=list.findIndex(y=>y.id===id),other=list[i+delta];if(other){const a=state.items.indexOf(x),z=state.items.indexOf(other);[state.items[a],state.items[z]]=[state.items[z],state.items[a]];}},\'업무 순서를 바꿨어요\'));\nroot.style.setProperty(\'--daily-columns\',people.length);root.querySelectorAll(\'[data-daily]\').forEach(b=>{b.disabled=saving||b.dataset.person!==actor.display_name||data.readOnly;b.style.accentColor=data.members.find(m=>m.display_name===b.dataset.person)?.color||\'#4285f4\';});root.querySelectorAll(\'button\').forEach(b=>{if(b.id!==\'news-toggle\'&&!b.hasAttribute(\'data-delete\'))b.disabled=saving;});\nmountEditor();mountAdd();bindHelp();bindFocusSort();bindDeadlineSort();resizeTables();bindTableSorting();\n}\nq(\'task-reply-required\').onchange=()=>replyDrafts.set(editId,q(\'task-reply-required\').checked);\nq(\'task-feedback-text\').oninput=()=>feedbackDrafts.set(editId,q(\'task-feedback-text\').value);\nq(\'task-feedback-form\').onsubmit=async e=>{e.preventDefault();const id=editId,text=q(\'task-feedback-text\').value.trim();if(!id||!text){notify(\'메모를 입력해주세요.\');return;}if((state.comments||[]).length>=500){notify(\'메모가 500개에 도달했어요. 기록 정리가 필요합니다.\');return;}const comment={id:crypto.randomUUID(),taskId:id,author:actor.display_name,text,at:new Date().toISOString(),readBy:[actor.display_name],replyRequired:q(\'task-reply-required\').checked};const ok=await mutate(()=>{state.comments=state.comments||[];state.comments.unshift(comment);},title(find(id))+\' 메모를 남겼어요\');if(ok){feedbackDrafts.delete(id);replyDrafts.delete(id);if(editId===id){q(\'task-feedback-text\').value=\'\';q(\'task-reply-required\').checked=false;}}};\nq(\'my-emoji\').onchange=async()=>{const emoji=q(\'my-emoji\').value;if(!emojiChoices.includes(emoji))return;await mutate(()=>{state.memberEmoji=state.memberEmoji||{};state.memberEmoji[actor.display_name]=emoji;},actor.display_name+\' 이모지를 바꿨어요\');};\nq(\'help-close\').onclick=()=>q(\'help-dialog\').close();\nq(\'help-form\').onsubmit=async e=>{e.preventDefault();const id=helpTaskId,kind=q(\'help-kind\').value,reason=q(\'help-reason\').value.trim();const ok=await mutate(()=>{const x=find(id);if(!x||x.status!==\'active\'||x.helpRequest?.status===\'pending\')throw new Error(\'이미 요청 중이거나 완료된 업무예요.\');x.helpRequest={status:\'pending\',kind,reason,by:actor.display_name,at:new Date().toISOString()};},\'도움 요청을 남겼어요\');if(ok)q(\'help-dialog\').close();};\nq(\'review-toggle\').onclick=()=>{const content=q(\'review-list\');content.hidden=!content.hidden;q(\'review-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'review-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'feedback-toggle\').onclick=()=>{const content=q(\'feedback-pending\');content.hidden=!content.hidden;q(\'feedback-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'feedback-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'new-toggle\').onclick=()=>{const content=q(\'new-content\');content.hidden=!content.hidden;q(\'new-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'new-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'daily-toggle\').onclick=()=>{const content=q(\'daily-content\');content.hidden=!content.hidden;q(\'daily-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'daily-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'daily-add-toggle\').onclick=()=>{q(\'daily-content\').hidden=false;q(\'daily-toggle\').textContent=\'▾ 접기\';q(\'daily-toggle\').setAttribute(\'aria-expanded\',\'true\');const form=q(\'daily-add-form\');form.hidden=!form.hidden;q(\'daily-add-toggle\').setAttribute(\'aria-expanded\',String(!form.hidden));if(!form.hidden)q(\'daily-add-title\').focus({preventScroll:true});};\nq(\'daily-add-close\').onclick=()=>{q(\'daily-add-form\').hidden=true;q(\'daily-add-toggle\').setAttribute(\'aria-expanded\',\'false\');};\nq(\'daily-add-form\').onsubmit=async e=>{e.preventDefault();const t=q(\'daily-add-title\').value.trim();if(!t)return;const input={id:crypto.randomUUID(),area:\'미분류\',title:t,owner:\'미정\',start:day(),due:\'\',added:day(),note:\'\',result:\'\',link:\'\',daily:true,checks:{},status:\'active\'};const ok=await mutate(()=>state.items.push(input),t+\' Daily 할 일에 추가했어요\');if(ok){q(\'daily-add-title\').value=\'\';q(\'daily-add-form\').hidden=true;q(\'daily-add-toggle\').setAttribute(\'aria-expanded\',\'false\');viewDay=day();render();}};\nq(\'add-form\').onsubmit=async e=>{e.preventDefault();const t=q(\'task-title\').value.trim();if(!t)return;const create=q(\'task-section\').value===\'__new__\',area=create?q(\'task-new-section\').value.trim():q(\'task-section\').value;if(!area){notify(\'새 섹션 이름을 입력해주세요.\');return;}if(create&&sections().includes(area)){notify(\'이미 있는 섹션이에요. 목록에서 선택해주세요.\');return;}if(create&&sections().length>=25){notify(\'섹션은 25개까지 만들 수 있어요.\');return;}const link=q(\'task-link\').value.trim();if(link&&!safeLink(link)){notify(\'결과물 링크는 http 또는 https 주소로 적어주세요.\');return;}const feedback=q(\'task-feedback\').value.trim();if(feedback&&(state.comments||[]).length>=500){notify(\'메모가 500개에 도달했어요.\');return;}const input={id:crypto.randomUUID(),area,title:t,owner:q(\'task-owner\').value,start:day(),due:q(\'task-due\').value,urgency:q(\'task-urgency\').value,importance:q(\'task-importance\').value,added:day(),note:q(\'task-note\').value.trim(),result:q(\'task-result\').value.trim(),link,emailSubject:q(\'task-email\').value.trim(),daily:q(\'task-daily\').checked,weekGoal:q(\'task-week\').checked?weekStart(day()):\'\',checks:{},status:\'active\'};if(input.note||input.result||input.link||input.emailSubject){input.needsReview=true;input.reviewKind=\'note\';input.noteUpdatedBy=actor.display_name;input.noteUpdatedAt=day();input.noteUpdatedTime=new Date().toISOString();input.noteReadBy=[];}const ok=await mutate(()=>{if(create)state.sections=[...sections(),area];state.items.push(input);if(feedback){state.comments=state.comments||[];state.comments.unshift({id:crypto.randomUUID(),taskId:input.id,author:actor.display_name,text:feedback,at:new Date().toISOString(),readBy:[actor.display_name]});}},t+\' 새로 추가했어요\');if(ok){q(\'task-title\').value=\'\';for(const id of [\'task-note\',\'task-feedback\',\'task-result\',\'task-link\',\'task-email\'])q(id).value=\'\';q(\'task-week\').checked=false;q(\'task-urgency\').value=\'미정\';q(\'task-importance\').value=\'미정\';viewDay=day();addedDay=null;addSection=null;q(\'add-close\').hidden=false;render();}};\nq(\'add-close\').onclick=()=>{addSection=null;mountAdd();addHome.open=false;q(\'add-home-section\').hidden=true;q(\'top-add-toggle\').textContent=\'＋ 새 업무 추가\';q(\'top-add-toggle\').setAttribute(\'aria-expanded\',\'false\');};q(\'top-add-toggle\').onclick=()=>{addHome.open=!addHome.open;q(\'add-home-section\').hidden=!addHome.open;};addHome.ontoggle=()=>{q(\'top-add-toggle\').textContent=addHome.open?\'▾ 입력창 접기\':\'＋ 새 업무 추가\';q(\'top-add-toggle\').setAttribute(\'aria-expanded\',String(addHome.open));q(\'add-home-section\').hidden=!addHome.open;addHome.querySelector(\'summary\').textContent=addHome.open?\'▾ 입력창 접기\':\'＋ 새 업무 추가\';if(addHome.open&&addSection){addSection=null;mountAdd();q(\'add-close\').hidden=false;}};\nq(\'task-section\').onchange=()=>{q(\'new-section-label\').hidden=q(\'task-section\').value!==\'__new__\';q(\'task-new-section\').required=q(\'task-section\').value===\'__new__\';};\nq(\'edit-form\').oninput=()=>dirtyEditor=true;\nq(\'edit-form\').onsubmit=async e=>{e.preventDefault();const id=editId,x=find(id);if(!x)return;const link=q(\'edit-link\').value.trim();if(link&&!safeLink(link)){notify(\'결과물 링크는 http 또는 https 주소로 적어주세요.\');return;}const values={owner:q(\'edit-owner\').value,start:q(\'edit-start\').value,due:q(\'edit-due\').value,emailSubject:q(\'edit-email\').value,link};const remoteItem=read(bridge.widgetState)?.items.find(item=>item.id===id);const updates=Object.fromEntries(Object.entries(values).filter(([k,v])=>v!==(editBase?.[k]||\'\')));if(Object.keys(updates).some(k=>(remoteItem?.[k]||\'\')!==(editBase?.[k]||\'\'))){notify(\'다른 팀원이 이 노트를 수정했어요. 작성한 내용은 유지됩니다. 최신 내용을 확인하고 다시 작성해주세요.\');return;}const changed=[\'link\',\'emailSubject\'].some(k=>(x[k]||\'\')!==(values[k]||\'\'));const ok=await mutate(()=>{Object.assign(find(id),updates);if(changed){find(id).needsReview=true;find(id).reviewKind=\'note\';find(id).noteUpdatedAt=day();find(id).noteUpdatedBy=actor.display_name;find(id).noteUpdatedTime=new Date().toISOString();find(id).noteReadBy=[];}},title(x)+\' 노트 / 결과물을 업데이트했어요\');if(ok){noteDrafts.delete(id);q(\'edit-close\').onclick();}};\nq(\'edit-close\').onclick=()=>{editorNode.hidden=true;root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());editId=null;dirtyEditor=false;};\nq(\'news-toggle\').onclick=()=>q(\'news-panel\').hidden=!q(\'news-panel\').hidden;q(\'next-day\').onclick=()=>{viewDay=plus(viewDay,1);render();};q(\'real-day\').onclick=()=>{viewDay=day();render();};\nparentElement._operation={root,receive(nextData){\n  bridge.widgetState={modelContent:{board:nextData.board}};\n  const changed=revision!==nextData.revision;revision=nextData.revision;\n  if(pending&&nextData.ack?.id===pending.id){const request=pending;pending=null;if(nextData.ack.ok)request.resolve();else request.reject(new Error(nextData.ack.message||\'다른 팀원이 먼저 수정했어요. 최신 내용으로 다시 시도해주세요.\'));return;}\n  const next=read(bridge.widgetState);if(!valid(next)||saving)return;\n  const focused=parentElement.activeElement;\n  if(changed&&!dirtyEditor&&!(focused&&[\'INPUT\',\'TEXTAREA\',\'SELECT\'].includes(focused.tagName))){const fresh=next.events.filter(x=>!seen.has(x.id));state=structuredClone(next);seen=new Set(next.events.map(x=>x.id));render();if(fresh.length)notify((fresh[0].actor?fresh[0].actor+\' · \':\'\')+fresh[0].text);}\n}};\nlet last=day();\nconst poll=setInterval(()=>{if(!root.isConnected){clearInterval(poll);return;}const now=day();if(now!==last){if(viewDay===last)viewDay=now;last=now;render();}if(!saving&&!dirtyEditor&&!drag)setTriggerValue(\'refresh\',Date.now());},5000);\nq(\'updates-toggle\').onclick=()=>{const content=q(\'updates-group\');content.hidden=!content.hidden;const collapsed=content.hidden;q(\'updates-toggle\').textContent=collapsed?\'▸ 업데이트 펼치기\':\'▾ 업데이트 접기\';q(\'updates-toggle\').setAttribute(\'aria-expanded\',String(!collapsed));if(collapsed){q(\'news-panel\').hidden=true;q(\'weekly-section\').scrollIntoView({behavior:\'smooth\',block:\'start\'});}};\nrender();\n}\n'
-
-
-
-@st.cache_resource
-
-def login_storage():
-
-    return st.components.v2.component("operation_login_storage", html="<span></span>", js="""
-
-export default function({parentElement,data,setTriggerValue}) {
-
-  if (parentElement._loginCommand === data.id) return;
-
-  parentElement._loginCommand = data.id;
-
-  try {
-
-    let token = null;
-
-    if (data.action === 'store') localStorage.setItem(data.key, data.token);
-
-    if (data.action === 'clear') localStorage.removeItem(data.key);
-
-    if (data.action === 'restore') token = localStorage.getItem(data.key);
-
-    setTriggerValue('reply', {id:data.id, token, ok:true});
-
-  } catch (_) { setTriggerValue('reply', {id:data.id, ok:false}); }
-
-}
-
-""")
-
-
-
-
-
-def restore_login():
-
-    if "login_storage_command" not in st.session_state:
-
-        st.session_state.login_storage_command = {"id": str(uuid.uuid4()), "action": "restore"}
-
-    command = st.session_state.login_storage_command
-
-    result = login_storage()(data={**command, "key": "operation-login:" + URL}, key="login_storage", on_reply_change=lambda: None, height=0)
-
-    reply = result.get("reply")
-
-    if reply and reply.get("id") == command["id"] and st.session_state.get("login_storage_handled") != command["id"]:
-
-        st.session_state.login_storage_handled = command["id"]
-
-        st.session_state.login_storage_ready = True
-
-        if command["action"] == "restore" and reply.get("token"):
-
-            try:
-
-                session = api("/auth/v1/token?grant_type=refresh_token", "POST", {"refresh_token": reply["token"]})
-
-                api("/auth/v1/user", token=session["access_token"])
-
-                session.setdefault("expires_at", time.time() + session.get("expires_in", 3600))
-
-                st.session_state.auth = session
-
-                st.session_state.remember_login = True
-
-                queue_login_storage("store", session["refresh_token"])
-
-                st.rerun()
-
-            except (RuntimeError, urllib.error.URLError):
-
-                queue_login_storage("clear")
-
-                st.rerun()
-
-        if not reply.get("ok"):
-
-            st.caption("브라우저의 저장 제한으로 로그인 유지가 안 될 수 있습니다.")
-
-    if not st.session_state.get("login_storage_ready"):
-
-        st.caption("로그인 상태를 확인하고 있어요…")
-
-        if st.button("로그인 화면으로 계속"):
-
-            st.session_state.login_storage_ready = True
-
-            st.rerun()
-
-        st.stop()
-
-
-
-
-
-def queue_login_storage(action, token=None):
-
-    st.session_state.login_storage_command = {"id": str(uuid.uuid4()), "action": action, "token": token}
-
-
-
-
-
-@st.cache_resource
-
-def board_component(html, js, css):
-
-    version = hashlib.sha256((html + js + css).encode()).hexdigest()[:12]
-
-    return st.components.v2.component(
-
-        "operation_board_" + version, html=html, js=js, css=css,
-
-    )
-
-
-
-
-
-preview = False
-
-if not URL or not KEY:
-
-    st.error("서버 연결 설정이 필요합니다.")
-
-    st.stop()
-
-st.markdown("<style>.block-container{padding-top:1.5rem}</style>", unsafe_allow_html=True)
-
-def save_feedback_update(update, message):
-
-    request_id = str(uuid.uuid4())
-
-    for attempt in range(3):
-
-        latest = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)[0]
-
-        update(latest["body"])
-
-        saved = api("/rest/v1/rpc/operation_save", "POST", {
-
-            "p_expected_revision": latest["revision"], "p_body": latest["body"],
-
-            "p_request_id": request_id, "p_message": message,
-
-        }, token=token)
-
-        if saved.get("ok"):
-
-            return
-
-    raise RuntimeError("다른 변경과 겹쳤어요. 다시 눌러주세요.")
-
-
-
-
-
-@st.dialog("삭제할까요?")
-
-def confirm_feedback_delete(comment_id):
-
-    st.write("이 피드백을 삭제할까요?")
-
-    yes, no = st.columns(2)
-
-    if yes.button("삭제", key="confirm_feedback_delete"):
-
-        try:
-
-            def remove(body):
-
-                target = next(c for c in body.get("comments", []) if c["id"] == comment_id)
-
-                if target.get("author") != actor["display_name"]:
-
-                    raise RuntimeError("본인 글만 삭제할 수 있어요.")
-
-                target["deletedAt"] = datetime.now(timezone.utc).isoformat()
-
-            save_feedback_update(remove, "본인 피드백을 삭제했어요")
-
-            st.rerun()
-
-        except (RuntimeError, urllib.error.URLError) as error:
-
-            st.error(str(error))
-
-    if no.button("취소", key="cancel_feedback_delete"):
-
-        st.rerun()
-
-
-
-
-
-if not preview:
-
-    restore_login()
-
-if not preview and not st.session_state.get("auth"):
-
-    st.caption("회사 이메일로 로그인하면 체크와 수정 기록에 내 이름이 남습니다.")
-
-    with st.form("login"):
-
-        email = st.text_input("이메일")
-
-        password = st.text_input("비밀번호", type="password")
-
-        remember_login = st.checkbox("이 브라우저에서 로그인 유지", value=True)
-
-        login = st.form_submit_button("로그인", type="primary")
-
-    if login:
-
-        try:
-
-            session = api("/auth/v1/token?grant_type=password", "POST", {
-
-                "email": email.strip(), "password": password,
-
-            })
-
-            session.setdefault("expires_at", time.time() + session.get("expires_in", 3600))
-
-            st.session_state.auth = session
-
-            st.session_state.remember_login = remember_login
-
-            queue_login_storage("store" if remember_login else "clear", session.get("refresh_token") if remember_login else None)
-
-            st.rerun()
-
-        except RuntimeError:
-
-            st.error("로그인하지 못했어요. 이메일·비밀번호와 이메일 인증 여부를 확인해주세요.")
-
-    with st.expander("처음 사용하는 경우 · 계정 만들기"):
-
-        with st.form("signup"):
-
-            signup_email = st.text_input("회사 이메일", key="signup_email")
-
-            signup_password = st.text_input("비밀번호 (8자 이상)", type="password", key="signup_password")
-
-            signup = st.form_submit_button("계정 만들기")
-
-        if signup:
-
-            if len(signup_password) < 8:
-
-                st.error("비밀번호를 8자 이상 입력해주세요.")
-
-            else:
-
-                try:
-
-                    api("/auth/v1/signup", "POST", {"email": signup_email.strip(), "password": signup_password})
-
-                    st.info("신규 계정이면 인증 메일을 확인해주세요. 이미 가입한 이메일은 다시 가입해도 비밀번호가 바뀌지 않습니다. 비밀번호를 모르면 아래 ‘비밀번호 재설정’을 이용해주세요.")
-
-                except RuntimeError:
-
-                    st.error("가입 요청을 처리하지 못했어요. Supabase 이메일 가입 설정을 확인해주세요.")
-
-    with st.expander("비밀번호 재설정"):
-
-        st.caption("회사 이메일로 인증번호를 받은 뒤 새 비밀번호를 정해주세요.")
-
-        with st.form("recovery_send"):
-
-            recovery_email = st.text_input("재설정할 이메일").strip().lower()
-
-            send_recovery = st.form_submit_button("인증번호 이메일 보내기")
-
-        if send_recovery:
-
-            if not recovery_email or "@" not in recovery_email:
-
-                st.error("이메일을 입력해주세요.")
-
-            elif time.time() < st.session_state.get("recovery_sent_at", 0) + 60:
-
-                st.warning("재발송은 1분 뒤에 시도해주세요.")
-
-            else:
-
-                try:
-
-                    api("/auth/v1/recover", "POST", {"email": recovery_email})
-
-                    st.session_state.recovery_email = recovery_email
-
-                    st.session_state.recovery_sent_at = time.time()
-
-                    st.session_state.pop("recovery_session", None)
-
-                    st.success("등록된 이메일이면 재설정 메일이 발송됩니다. 스팸함도 확인해주세요.")
-
-                except (RuntimeError, urllib.error.URLError) as error:
-
-                    st.error("메일 발송 요청 실패: " + str(error))
-
-        with st.form("recovery_verify", clear_on_submit=True):
-
-            verify_email = st.text_input("인증할 이메일", value=st.session_state.get("recovery_email", "")).strip().lower()
-
-            recovery_code = st.text_input("메일의 인증번호", type="password")
-
-            new_password = st.text_input("새 비밀번호 (8자 이상)", type="password")
-
-            confirm_password = st.text_input("새 비밀번호 확인", type="password")
-
-            reset_password = st.form_submit_button("비밀번호 변경")
-
-        if reset_password:
-
-            if len(new_password) < 8 or new_password != confirm_password:
-
-                st.error("8자 이상의 같은 비밀번호를 두 번 입력해주세요.")
-
-            else:
-
-                try:
-
-                    recovery = st.session_state.get("recovery_session", {})
-
-                    if recovery.get("email") != verify_email or recovery.get("expires_at", 0) < time.time():
-
-                        verified = api("/auth/v1/verify", "POST", {"email": verify_email, "token": recovery_code.strip(), "type": "recovery"})
-
-                        recovery = {"email": verify_email, "access_token": verified["access_token"], "expires_at": time.time() + min(verified.get("expires_in", 3600), 600)}
-
-                        st.session_state.recovery_session = recovery
-
-                    api("/auth/v1/user", "PUT", {"password": new_password}, token=recovery["access_token"])
-
-                    st.session_state.pop("recovery_session", None)
-
-                    st.success("비밀번호를 변경했어요. 위 로그인 칸에서 새 비밀번호로 로그인해주세요.")
-
-                except (RuntimeError, urllib.error.URLError) as error:
-
-                    st.error("비밀번호 재설정 실패: " + str(error))
-
-    st.stop()
-
-
-
-try:
-
-    if preview:
-
-        row = {"body": json.loads((HERE / "seed.json").read_text(encoding="utf-8")), "revision": 0}
-
-        actor = {"display_name": "Hugo", "color": "#4285f4"}
-
-        members = [{"display_name": "Hugo", "color": "#4285f4"}, {"display_name": "Jayna", "color": "#b278ed"}]
-
-        st.info("화면 미리보기 · 데이터 변경은 저장되지 않습니다.")
-
-        token = None
-
-    else:
-
-        token = session_token()
-
-        if st.session_state.get("remember_login"):
-
-            refresh = st.session_state.auth["refresh_token"]
-
-            if st.session_state.login_storage_command.get("token") != refresh:
-
-                queue_login_storage("store", refresh)
-
-                st.rerun()
-
-        user = api("/auth/v1/user", token=token)
-
-        members = api("/rest/v1/operation_members?select=email,display_name,color&order=display_name", token=token)
-
-        actor = next((m for m in members if m["email"].lower() == user["email"].lower()), None)
-
-        if not actor:
-
-            st.error("이 업무판에 등록된 팀원 계정이 아닙니다.")
-
-            if st.button("다른 계정으로 로그인"):
-
-                st.session_state.clear()
-
-                st.rerun()
-
-            st.stop()
-
-        with st.sidebar:
-
-            st.write(f"● {actor['display_name']}")
-
-            st.caption("화면은 5초마다 최신 내용을 확인합니다.")
-
-            if st.button("로그아웃"):
-
-                try:
-
-                    api("/auth/v1/logout", "POST", token=token)
-
-                finally:
-
-                    st.session_state.clear()
-
-                    st.session_state.login_storage_ready = True
-
-                    queue_login_storage("clear")
-
-                    st.rerun()
-
-            if st.button("새로고침"):
-
-                st.rerun()
-
-        rows = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)
-
-        if not rows:
-
-            st.error("업무판 초기 데이터가 아직 연결되지 않았습니다.")
-
-            st.stop()
-
-        row = rows[0]
-
-except (RuntimeError, urllib.error.URLError):
-
-    st.error("공동 저장 서버에 연결하지 못했어요. 변경하지 않고 연결을 다시 확인해주세요.")
-
-    if st.button("다시 연결"):
-
-        st.rerun()
-
-    st.stop()
-
-
-
-with st.sidebar:
-
-    st.markdown("### 메뉴")
-
-    page = st.radio("화면", ["업무판", "Weekly · 주간 보고"], label_visibility="collapsed")
-
-if page == "Weekly · 주간 보고":
-
-    if not preview and not row["body"].get("weeklyTrackingSince"):
-
-        save_feedback_update(lambda body: None, "주차별 업무 기록 보관을 시작했어요")
-
-        st.rerun()
-
-    weekly_render(st, row["body"], actor["display_name"], save_feedback_update)
-
-    st.stop()
-
-
-
-if not preview:
-
-    comments = [c for c in row["body"].get("comments", []) if not c.get("deletedAt")]
-
-    unread = [c for c in comments if c.get("author") != actor["display_name"]
-
-              and actor["display_name"] not in c.get("readBy", [])]
-
-    with st.sidebar.expander(f"메모·피드백 · 확인할 {len(unread)}개", expanded=True):
-
-        if st.session_state.pop("feedback_clear", False):
-
-            st.session_state.feedback_text = ""
-
-        tasks = {x["id"]: x for x in row["body"]["items"]}
-
-        with st.form("feedback_form"):
-
-            feedback_task = st.selectbox("관련 업무", [""] + list(tasks),
-
-                format_func=lambda id: "전체 / 자유 메모" if not id else tasks[id].get("area", "") + " · " + tasks[id]["title"])
-
-            feedback_text = st.text_area("할 말 / 요청 / 피드백", key="feedback_text", max_chars=1000)
-
-            submit_feedback = st.form_submit_button("메모 남기기")
-
-        if submit_feedback:
-
-            if not feedback_text.strip():
-
-                st.warning("메모 내용을 입력해주세요.")
-
-            else:
-
-                try:
-
-                    comment = {"id": str(uuid.uuid4()), "taskId": feedback_task,
-
-                        "author": actor["display_name"], "text": feedback_text.strip(),
-
-                        "at": datetime.now(timezone.utc).isoformat(), "readBy": [actor["display_name"]]}
-
-                    def add_comment(body):
-
-                        if len(body.get("comments", [])) >= 500:
-
-                            raise RuntimeError("메모가 500개에 도달했어요. 기록 정리가 필요합니다.")
-
-                        if not any(c["id"] == comment["id"] for c in body.get("comments", [])):
-
-                            body.setdefault("comments", []).insert(0, comment)
-
-                    save_feedback_update(add_comment, actor["display_name"] + " 메모·피드백을 남겼어요")
-
-                    st.session_state.feedback_clear = True
-
-                    st.rerun()
-
-                except (RuntimeError, urllib.error.URLError) as error:
-
-                    st.error(str(error))
-
-        st.caption("업무별 피드백과 전체 메모는 위 ‘확인할 메모’에 표시되고, 내가 쓴 글도 상대방이 확인하기 전까지 보여요.")
-
-        with st.expander(f"메모 기록 · {len(comments)}개"):
-
-            for c in comments:
-
-                task = tasks.get(c.get("taskId"), {})
-
-                when = datetime.fromisoformat(c["at"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).strftime("%m/%d %H:%M")
-
-                readers = ", ".join(n for n in c.get("readBy", []) if n != c.get("author")) or "대기"
-
-                st.caption(c.get("author", "") + " · " + when + " · 확인: " + readers)
-
-                st.caption(task.get("title") or "전체 메모")
-
-                st.write(c.get("text", ""))
-
-                if c.get("author") == actor["display_name"] and st.button("삭제", key="delete_" + c["id"]):
-
-                    confirm_feedback_delete(c["id"])
-
-                if c in unread and st.button("확인했어요", key="read_" + c["id"]):
-
-                    try:
-
-                        def mark_read(body):
-
-                            target = next(x for x in body.get("comments", []) if x["id"] == c["id"])
-
-                            target["readBy"] = list(dict.fromkeys(target.get("readBy", []) + [actor["display_name"]]))
-
-                        save_feedback_update(mark_read, "메모를 확인했어요")
-
-                        st.rerun()
-
-                    except (RuntimeError, urllib.error.URLError) as error:
-
-                        st.error(str(error))
-
-
-
-if not preview:
-
-    with st.sidebar.expander("진행 중 오더 · 원본 업데이트"):
-
-        order_file = st.file_uploader("Open SO Status 엑셀", type=["xlsx", "xlsm"], key="order_file")
-
-        source_link = st.text_input("원본 엑셀 링크", value=row["body"].get("orderSummary", {}).get("sourceUrl", ""))
-
-        if st.button("오더 요약 업데이트", disabled=order_file is None):
-
-            try:
-
-                source_link = source_link.strip()
-
-                if source_link and not source_link.startswith("https://"):
-
-                    raise ValueError("원본 링크는 https 주소로 입력해주세요.")
-
-                summary = parse_order_workbook(order_file.getvalue(), order_file.name, source_link)
-
-                for attempt in range(3):
-
-                    latest = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)[0]
-
-                    latest["body"]["orderSummary"] = summary
-
-                    saved = api("/rest/v1/rpc/operation_save", "POST", {
-
-                        "p_expected_revision": latest["revision"], "p_body": latest["body"],
-
-                        "p_request_id": str(uuid.uuid4()), "p_message": "진행 중 오더 요약을 업데이트했어요",
-
-                    }, token=token)
-
-                    if saved.get("ok"):
-
-                        break
-
-                if not saved.get("ok"):
-
-                    raise ValueError("다른 변경과 겹쳐 저장하지 못했어요. 다시 눌러주세요.")
-
-                st.session_state.order_import_success = len(summary["orders"])
-
-                st.rerun()
-
-            except (ValueError, RuntimeError, KeyError, OSError, SyntaxError) as error:
-
-                st.error("오더 업데이트 실패: " + str(error))
-
-        if "order_import_success" in st.session_state:
-
-            st.success(f"진행 중 {st.session_state.order_import_success}건 저장됨")
-
-
-
-result = board_component(BOARD_HTML, BOARD_JS, BOARD_CSS)(
-
-    data={"board": row["body"], "revision": row["revision"], "actor": actor,
-
-          "members": members, "ack": st.session_state.get("ack"), "readOnly": preview},
-
-    key="operation", on_change_change=lambda: None, on_refresh_change=lambda: None,
-
-)
-
-change = result.get("change")
-
-if change and change.get("id") != st.session_state.get("handled_request"):
-
-    request_id = change["id"]
-
-    try:
-
-        if preview:
-
-            response = {"ok": False, "message": "미리보기에서는 저장되지 않습니다."}
-
-        else:
-
-            response = api("/rest/v1/rpc/operation_save", "POST", {
-
-                "p_expected_revision": change["revision"], "p_body": change["board"],
-
-                "p_request_id": request_id, "p_message": change.get("message", "업무판을 업데이트했어요"),
-
-            }, token=token)
-
-        st.session_state.ack = {"id": request_id, **response}
-
-    except (RuntimeError, urllib.error.URLError):
-
-        st.session_state.ack = {"id": request_id, "ok": False, "message": "저장 실패. 다시 시도해주세요."}
-
-    st.session_state.handled_request = request_id
-
-    st.rerun()
-
+
+
+
+BOARD_CSS = '\n:host{--foreground:#f5f5f5;--muted-foreground:#999;--border:#383838;--primary:#4285f4;--ring:#4285f4;--blue:#4285f4;--purple:#b278ed;--green:#43c67b;--orange:#f3a547;--red:#fa646b;--yellow:#dccc5a;font:14px system-ui,sans-serif;color:var(--foreground)}\n*{box-sizing:border-box}h2{font-size:22px;margin:0}h3{font-size:18px;margin:14px 0}button,input,select,textarea{font:inherit;color:inherit}button,summary{cursor:pointer}button{border:1px solid #505050;border-radius:8px;background:#303030;padding:5px 10px;white-space:nowrap}button:hover{background:#414141}button:disabled,input:disabled{opacity:.45;cursor:default}input:not([type=checkbox]),textarea,select{background:#303030;border:1px solid #505050;border-radius:8px;padding:6px 8px;max-width:100%}input[type=checkbox]{accent-color:var(--primary)}.form-control{width:100%}.form-label{display:block;margin:8px 0}.form-label>input,.form-label>select,.form-label>textarea{display:block;margin-top:5px}.btn-primary{background:#2761c6}.btn-ghost{border-color:transparent;background:transparent}.table-responsive{overflow-x:auto}.table{border-collapse:collapse;width:100%;margin-top:10px}.table th,.table td{text-align:left;padding:8px 4px;border-bottom:1px solid var(--border)}.table th{font-size:13px}.table th:first-child{min-width:370px}.table th:not(:first-child){white-space:nowrap}.table input[type=text]{width:100%}.viz-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}.text-small{font-size:12px}hr{border:0;border-top:1px solid var(--border);margin:26px 0}#notice{color:#9ac1ff;margin-top:10px}#operation-v2 .daily-grid{grid-template-columns:minmax(200px,1fr) repeat(var(--daily-columns,2),55px) 120px}#operation-v2 .section-move{width:100px}#operation-v2 .fields{gap:8px}#operation-v2 .head{padding-right:0}a{color:#8cbbff}details{margin-top:10px}summary{color:#c6c6c6}\n\n#deadline-section .table th:first-child{min-width:130px}#deadline-section .deadline-area{display:block;white-space:nowrap}#deadline-section .table th:nth-child(2){min-width:370px}.priority-dot{font-weight:600;min-width:82px}\n\n.order-card{min-width:90px;display:flex;flex-direction:column;gap:6px;text-align:left;padding:12px}.order-card strong{font-size:22px}#orders-section .order-table th:first-child{min-width:150px}#orders-section .order-table td{vertical-align:top}#orders-section .order-table td:nth-child(2){white-space:nowrap}#orders-section .order-table td:last-child{min-width:200px;max-width:340px;white-space:normal}\n\n.message-meta{display:flex;align-items:center;gap:8px;font-size:12px;white-space:nowrap;overflow-x:auto;margin:6px 0}.message-meta button{font-size:12px;padding:3px 7px}.details>.note{margin:6px 0 14px}\n\n#operation-v2 button.has-note{color:#72e3a1;border-color:#39845a;background:#173b29;font-weight:600}\n#operation-v2 button.has-note:hover{color:#a0f3bf;background:#205037}\n\n#operation-v2 #help-dialog{background:#242424;color:#eee;border:1px solid #666;border-radius:12px;width:min(440px,90vw)}\n#operation-v2 #help-dialog::backdrop{background:#0009}\n#operation-v2 #help-dialog label{display:block;margin:14px 0}\n#operation-v2 #help-dialog select,#operation-v2 #help-dialog textarea{display:block;width:100%;margin-top:6px}\n#operation-v2 .help-needed{color:#ffc478;font-size:12px}\n#operation-v2 .help-accepted{color:#72e3a1;font-size:12px}\n\n#operation-v2 .focus-area{display:block;box-sizing:border-box;flex:0 0 96px;width:96px;min-width:0;padding-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n#operation-v2 #focus-list .title-cell>.form-check{flex:0 0 auto;white-space:nowrap;margin:0}\n\n#operation-v2 #editor{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);column-gap:24px;align-items:start}\n#operation-v2 #edit-title,#operation-v2 #note-meta{grid-column:1/-1}\n#operation-v2 #edit-form{display:contents}\n#operation-v2 #edit-form>.fields,#operation-v2 #edit-form>label{grid-column:1/-1}\n#operation-v2 .result-column{grid-column:2;grid-row:5;min-width:0}\n#operation-v2 .feedback-column{grid-column:1;grid-row:5;min-width:0;border-right:1px solid var(--border);padding-right:24px}\n#operation-v2 .feedback-column h4{margin:0 0 12px}\n#operation-v2 .result-column textarea,#operation-v2 .feedback-column textarea{width:100%;box-sizing:border-box;min-height:100px}\n#operation-v2 .feedback-column .message-meta{white-space:normal;flex-wrap:wrap}\n@media(max-width:700px){#operation-v2 #editor{grid-template-columns:minmax(0,1fr)}#operation-v2 .feedback-column{grid-column:1;grid-row:5;border-right:0;padding-right:0}#operation-v2 .result-column{grid-column:1;grid-row:6;margin-top:20px}}\n\n#operation-v2 .title-cell>[data-help-request],#operation-v2 .title-cell>[data-help-accept],#operation-v2 .title-cell>[data-help-cancel]{flex:0 0 auto;white-space:nowrap;margin-left:4px}\n\n#operation-v2 .new-task-toggle{display:inline-block;padding:10px 16px;background:#275cba;color:#fff;border:1px solid #6999ee;border-radius:8px;font-weight:700;cursor:pointer;margin:8px 0 16px}\n#operation-v2 .new-task-toggle:hover{background:#3470d3}\n#operation-v2 .new-task-priorities{display:grid;grid-template-columns:180px 135px 145px;gap:12px;grid-column:1/-1;align-items:end}\n#operation-v2 .new-task-priorities input,#operation-v2 .new-task-priorities select{width:100%;box-sizing:border-box}\n@media(max-width:520px){#operation-v2 .new-task-priorities{grid-template-columns:minmax(130px,1.3fr) minmax(90px,1fr) minmax(90px,1fr);gap:6px}}\n\n#operation-v2 #focus-list .section-move{display:none}\n\n#operation-v2 .week-cell{text-align:center;width:52px;white-space:nowrap}\n#operation-v2 .week-cell .form-check{display:flex;justify-content:center;margin:0}\n#operation-v2 .help-cell{white-space:nowrap}\n\n#operation-v2 #focus-list .title-cell{min-width:0}\n#operation-v2 .sort-header{border:0;background:transparent;color:inherit;font-weight:700;padding:0;white-space:nowrap;cursor:pointer}\n#operation-v2 .sort-header:hover{color:#91baff}\n\n#operation-v2 .new-task-notes{margin:12px 0;width:100%}\n#operation-v2 .new-note-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px}\n#operation-v2 .new-task-notes textarea,#operation-v2 .new-task-notes input{width:100%;box-sizing:border-box}\n@media(max-width:700px){#operation-v2 .new-note-columns{grid-template-columns:1fr}}\n\n#operation-v2 .task-jump-link{background:none;border:0;padding:0;color:inherit;font-weight:700;text-align:left;cursor:pointer}\n#operation-v2 .task-jump-link:hover{text-decoration:underline;color:#90baff}\n#operation-v2 .jump-highlight{outline:2px solid #709ee8;outline-offset:-2px;background:#29426155}\n\n#operation-v2 .collapse-toggle{min-width:94px;min-height:36px;padding:7px 14px;margin-left:8px;background:#234b78;color:#e5f1ff;border:1px solid #72adf0;font-size:14px;font-weight:700;box-shadow:0 1px 3px #0004}\n#operation-v2 .collapse-toggle[aria-expanded="false"]{background:#2865b0;color:#fff;border-color:#99c9ff}\n#operation-v2 .collapse-toggle:hover{background:#3478c8;border-color:#bedfff}\n#operation-v2 .collapse-toggle:focus-visible{outline:3px solid #b4d8ff;outline-offset:3px}\n\n#operation-v2 #urgent-section{border:1px solid #b65058;border-left:5px solid #ff6868;border-radius:10px;background:#351c2080;padding:4px 14px 14px;margin-top:20px}\n#operation-v2 #urgent-title{color:#ff9ca2}\n#operation-v2 select.is-urgent{background:#69262e;color:#fff!important;border:2px solid #ff828b;font-weight:800}\n#operation-v2 #urgent-list .section-move{display:none}\n\n#operation-v2 .focus-table th:first-child,#operation-v2 .focus-table td:first-child{min-width:0;width:86px;white-space:nowrap}\n#operation-v2 .focus-table td:first-child .title-cell{min-width:0;width:max-content;gap:4px}\n\n#operation-v2 #new-list>.line{display:grid;grid-template-columns:94px minmax(0,1fr);gap:12px;align-items:center}\n#operation-v2 #new-list>.line>button{width:94px;text-align:center;align-self:center}\n#operation-v2 #new-list>.line>.grow{display:grid;grid-template-columns:minmax(0,1fr) 122px;column-gap:20px;align-items:center;min-width:0}\n#operation-v2 #new-list>.line>.grow>strong{grid-column:1;grid-row:1;overflow-wrap:anywhere}\n#operation-v2 #new-list>.line>.grow>.secondary{grid-column:1;grid-row:2}\n#operation-v2 #new-list>.line>.grow>.actions{grid-column:2;grid-row:1 / 3;margin:0;justify-content:flex-end}\n#operation-v2 #new-list #editor{grid-column:1 / -1;width:100%;margin-top:12px}\n@media(max-width:520px){#operation-v2 #new-list>.line{grid-template-columns:80px minmax(0,1fr);gap:8px}#operation-v2 #new-list>.line>button{width:80px;padding:5px 4px}#operation-v2 #new-list>.line>.grow{column-gap:8px;grid-template-columns:minmax(0,1fr) 110px}}\n\n#operation-v2 #review-list .grow{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:20px;align-items:center;width:100%}\n#operation-v2 #review-list .task-jump-link{grid-column:1;grid-row:1;justify-self:start}\n#operation-v2 #review-list .message-meta{grid-column:1;grid-row:2;flex-wrap:wrap;white-space:normal}\n#operation-v2 #review-list .grow>.actions{grid-column:2;grid-row:1 / 3;margin:0}\n#operation-v2 #review-list .details{grid-column:1 / -1;margin-top:12px}\n\n#operation-v2 .review-heading{grid-column:1;grid-row:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap}\n#operation-v2 .review-kind{font-size:12px;font-weight:700;padding:4px 8px;border-radius:6px;white-space:nowrap}\n#operation-v2 .review-note{background:#233e61;color:#a9d1ff}\n#operation-v2 .review-complete{background:#194c32;color:#8be5ad}\n\n#operation-v2 .task-progress{display:inline-flex;flex-direction:column;gap:3px;width:76px;min-width:76px;vertical-align:middle}\n#operation-v2 .task-progress select{width:76px;min-width:0;padding:4px 6px}\n#operation-v2 .task-progress progress{width:76px;height:5px;accent-color:#58d6a0;border:0;border-radius:4px;overflow:hidden}\n#operation-v2 .task-progress progress::-webkit-progress-bar{background:#39434c}\n#operation-v2 .task-progress progress::-webkit-progress-value{background:#58d6a0}\n\n#operation-v2 .profile-corner{position:fixed;top:5px;right:170px;z-index:1000000;display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:8px;background:var(--background,#171717);font-size:13px}\n#operation-v2 .profile-corner select{width:62px}\n#operation-v2 .new-task-launch{margin-top:14px}\n@media(max-width:650px){#operation-v2 .profile-corner{right:125px;gap:4px;padding:4px}#operation-v2 .profile-corner label{display:none}}\n\n#operation-v2 [data-drag-item],#operation-v2 [data-drag-section]{cursor:grab!important;touch-action:none}\n#operation-v2.dragging-task,#operation-v2.dragging-task *{cursor:grabbing!important}\n#operation-v2 .drag-source{opacity:.45}\n#operation-v2 .drop-before>td{box-shadow:inset 0 3px #69acff}\n#operation-v2 .drop-after>td{box-shadow:inset 0 -3px #69acff}\n\n/* One append-only memo composer alongside result references. */\n#operation-v2 #editor .feedback-column{grid-row:4}\n#operation-v2 #editor .result-column{grid-row:4}\n#operation-v2 #editor textarea[hidden],#operation-v2 #add-form textarea[hidden]{display:none!important}\n@media(max-width:700px){#operation-v2 #editor .result-column{grid-row:5}}\n\n#operation-v2 .reply-badge{display:inline-flex;align-items:center;padding:3px 7px;border:1px solid #e7b65a;border-radius:5px;background:#49391d;color:#ffdc90;font-size:12px;font-weight:700;white-space:nowrap}#operation-v2 .reply-badge.resolved{background:transparent;color:var(--muted-foreground);border-color:var(--border)}#operation-v2 .reply-option{display:inline-flex;align-items:center;gap:6px}\n\n/* Compact original layout, with user-adjustable column widths. */\n#operation-v2{font-size:13px}\n#operation-v2 section{margin-top:12px}\n#operation-v2 h2{font-size:16px;margin:6px 0}\n#operation-v2 h3{font-size:15px;margin:8px 0}\n#operation-v2 .line{padding:5px 0}\n#operation-v2 .daily-grid{padding:3px 0;min-height:28px}\n#operation-v2 .table td,#operation-v2 .table th{padding:3px 8px;height:28px;line-height:20px;vertical-align:middle}\n#operation-v2 .table button,#operation-v2 .table select,#operation-v2 .table input{min-height:24px;padding:2px 5px;font-size:12px}\n#operation-v2 .table .actions{margin-top:0}\n#operation-v2 .table-responsive{overflow:auto}\n#operation-v2 .user-resizable-table{table-layout:fixed;min-width:0}\n#operation-v2 .user-resizable-table td{overflow:hidden;text-overflow:ellipsis}\n#operation-v2 .resize-column{position:relative}\n#operation-v2 .column-resizer{position:absolute;top:0;right:-3px;bottom:0;width:7px;cursor:col-resize;z-index:4;touch-action:none}\n#operation-v2 .column-resizer:hover,#operation-v2 .column-resizer:focus{background:#4684a4;outline:none}\n#operation-v2 .user-resizable-table input,#operation-v2 .user-resizable-table select{max-width:100%;box-sizing:border-box}\n\n#operation-v2 .table-sort-label{border:0;background:transparent;color:inherit;padding:0 8px 0 0;text-align:left;cursor:pointer;white-space:nowrap}\n\n#operation-v2 #active-list .section-label{width:120px;min-width:100px;vertical-align:top;background:#f2f5f7;padding:10px 8px;border-right:1px solid #cfd7dd;white-space:normal}\n#operation-v2 #active-list .section-label h2{font-size:13px;margin:0 0 8px;padding:0;border:0}\n#operation-v2 #active-list .section-settings{font-size:11px;margin-top:8px}\n#operation-v2 #active-list .section-settings summary{cursor:pointer}\n#operation-v2 #active-list .section-column-labels th{background:#f7f8f9}\n'
+
+
+
+BOARD_JS = '\nexport default function(component){\nconst {parentElement,data,setTriggerValue}=component;\nif(parentElement._operation?.root===parentElement.querySelector(\'#operation-v2\')){parentElement._operation.receive(data);return;}\nlet revision=data.revision,pending=null;\nconst actor=data.actor;\nconst people=data.members.map(x=>x.display_name);\nconst bridge={widgetState:{modelContent:{board:data.board}},setWidgetState(payload){\n  return new Promise((resolve,reject)=>{\n    const id=crypto.randomUUID();pending={id,resolve,reject};\n    setTriggerValue(\'change\',{id,revision,board:payload.modelContent.board,message:payload.modelContent.board.events[0]?.text||\'업무판을 업데이트했어요\'});\n  });\n}};\n\nconst root=parentElement.querySelector(\'#operation-v2\'),q=id=>root.querySelector(\'#\'+id);\nconst editorNode=q(\'editor\');\nq(\'active-list\').closest(\'section\').before(q(\'deadline-section\'));\n\nconst noteDrafts=new Map(),feedbackDrafts=new Map(),replyDrafts=new Map(),openReviews=new Set();\nlet addedDay=null,addSection=null,editBase=null,orderStatus=null,editLocation=null;\nfunction editorLocation(button){const history=button?.closest(\'[data-section-history]\');return history?\'[data-section-history="\'+CSS.escape(history.dataset.sectionHistory)+\'"]\':button?.closest(\'[id]\')?.id?\'#\'+CSS.escape(button.closest(\'[id]\').id):null;}\nconst addForm=q(\'add-form\'),addHome=addForm.parentElement;\nfunction mountAdd(){addHome.append(addForm);root.querySelectorAll(\'[data-inline-add]\').forEach(x=>x.remove());if(!addSection)return;const header=Array.from(root.querySelectorAll(\'[data-section]\')).find(x=>x.dataset.section===addSection);if(!header){addSection=null;return;}const row=document.createElement(\'tr\');row.dataset.inlineAdd=addSection;const cell=document.createElement(\'td\');cell.colSpan=7;cell.style.whiteSpace=\'normal\';row.append(cell);header.after(row);cell.append(addForm);q(\'add-close\').hidden=false;}\nfunction syncGroupSpans(){root.querySelectorAll(\'#active-list tr[data-section]\').forEach(header=>{let count=1,row=header.nextElementSibling;while(row&&!row.hasAttribute(\'data-section\')){count++;row=row.nextElementSibling;}const label=header.querySelector(\'.section-label\');if(label)label.rowSpan=count;});}\n\nfunction mountEditor(){if(!editId||editorNode.hidden)return;const button=(editLocation?root.querySelector(editLocation+\' [data-edit="\'+CSS.escape(editId)+\'"]\'):null)||root.querySelector(\'[data-item-row="\'+editId+\'"] [data-edit]\')||root.querySelector(\'[data-edit="\'+editId+\'"]\');if(!button)return;const row=button.closest(\'tr\');if(row){const next=document.createElement(\'tr\');next.dataset.inlineEditor=\'true\';const cell=document.createElement(\'td\');cell.colSpan=row.children.length;next.append(cell);row.after(next);cell.append(editorNode);syncGroupSpans();}else{const daily=button.closest(\'.daily-grid\');if(daily)daily.querySelector(\'.inline-slot\').append(editorNode);else button.closest(\'.grow\').append(editorNode);}}\nconst day=()=>new Intl.DateTimeFormat(\'sv-SE\',{timeZone:\'America/New_York\',year:\'numeric\',month:\'2-digit\',day:\'2-digit\'}).format(new Date());\nconst plus=(d,n)=>{const x=new Date(d+\'T12:00:00Z\');x.setUTCDate(x.getUTCDate()+n);return x.toISOString().slice(0,10);};\nconst read=s=>s?.modelContent?.board;const valid=x=>x?.version===2&&Array.isArray(x.items)&&Array.isArray(x.events);\nlet state=structuredClone(data.board),viewDay=day(),editId=null,saving=false,dirtyEditor=false,seen=new Set(state.events.map(x=>x.id));\nlet drag=null;\nconst completions=new Set();\nlet completing=false;\nfunction completeNow(id){\n  if(data.readOnly||completions.has(id))return;\n  completions.add(id);render();notify(\'완료 처리 중…\');flushCompletions();\n}\nasync function flushCompletions(){\n  if(completing||!completions.size)return;\n  if(saving){setTimeout(flushCompletions,60);return;}\n  completing=true;\n  const ids=[...completions];\n  const ok=await mutate(()=>{for(const id of ids){const item=find(id);if(item){item.status=\'complete\';item.doneDate=day();item.needsReview=true;item.reviewKind=\'complete\';item.completedBy=actor.display_name;item.completedTime=new Date().toISOString();item.completionReadBy=[];}}},ids.length===1?(find(ids[0])?.title||\'업무\')+\' 완료했어요\':ids.length+\'개 업무를 완료했어요\');\n  ids.forEach(id=>completions.delete(id));completing=false;render();\n  if(!ok)notify(\'완료 저장에 실패해 업무를 다시 표시했어요. 다시 시도해주세요.\');\n  flushCompletions();\n}\nconst emojiChoices=[\'\',\'🙂\',\'😎\',\'😊\',\'🐻\',\'🐱\',\'🐶\',\'🦊\',\'🐼\',\'🐰\',\'🦁\',\'🐯\',\'🐸\',\'🐧\',\'🦉\',\'🌻\',\'🌷\',\'🍀\',\'⭐\',\'🌙\',\'🔥\',\'🚀\',\'💎\',\'🎯\'];\nfunction personLabel(name){if(name===\'함께\')return \'🙋 함께\';const key=name===\'제이나\'?\'Jayna\':name;const emoji=state.memberEmoji?.[key];return (emojiChoices.includes(emoji)&&emoji?emoji+\' \':\'\')+name;}\nfunction shortTime(value){if(!value)return \'시간 미기록\';if(value.length===10)return value.slice(5).replace(\'-\',\'/\');const d=new Date(value);if(Number.isNaN(d.getTime()))return \'시간 미기록\';const p=new Intl.DateTimeFormat(\'en-US\',{timeZone:\'America/New_York\',month:\'2-digit\',day:\'2-digit\',hour:\'2-digit\',minute:\'2-digit\',hour12:false}).formatToParts(d);const get=t=>p.find(x=>x.type===t)?.value;return get(\'month\')+\'/\'+get(\'day\')+\' \'+get(\'hour\')+\':\'+get(\'minute\');}\nfunction cleanNote(value){return String(value||\'\').replace(/^화면\\s*기록\\s*[:：]\\s*/, \'\');}\nfunction reviewActor(x){return x.reviewKind===\'complete\'?x.completedBy:x.noteUpdatedBy;}\nfunction reviewMeta(x){return x.reviewKind===\'complete\'?personLabel(x.completedBy||\'작성자 미기록\')+\' · \'+shortTime(x.completedTime||x.doneDate)+\' · 확인: \'+((x.completionReadBy||[]).map(personLabel).join(\', \')||\'대기\'):noteMeta(x);}\nfunction noteMeta(x){return (x.noteUpdatedBy?personLabel(x.noteUpdatedBy):\'작성자 미기록\')+\' · \'+shortTime(x.noteUpdatedTime||x.noteUpdatedAt)+\' · 확인: \'+((x.noteReadBy||[]).map(personLabel).join(\', \')||\'대기\');}\nlet helpTaskId=null;\nfunction helpControls(x,allowRequest=false){const h=x.helpRequest;if(h?.status===\'pending\')return \'<span class="help-needed">🟠 도움 필요</span> \'+(h.by===actor.display_name?\'<button type="button" data-help-cancel="\'+esc(x.id)+\'">요청 취소</button>\':\'<button type="button" data-help-accept="\'+esc(x.id)+\'">🙋 내가 할게요</button>\');if(h?.status===\'accepted\')return \'<span class="help-accepted">🙋 \'+esc(personLabel(h.acceptedBy))+\' · \'+(h.kind===\'assist\'?\'함께 돕는 중\':\'맡았어요\')+\'</span>\';return allowRequest?\'<button type="button" data-help-request="\'+esc(x.id)+\'">🙋 손이 필요해요</button>\':\'\';}\nfunction offerControls(x){const o=x.helpOffer;if(o?.status===\'accepted\')return \'<span class="help-accepted">🤚 \'+esc(personLabel(o.by))+\' 함께 돕는 중</span>\';if(o?.status===\'pending\')return o.by===actor.display_name?\'<span>제안 대기</span><button type="button" data-offer-cancel="\'+esc(x.id)+\'">제안 취소</button>\':\'<button type="button" data-offer-accept="\'+esc(x.id)+\'">같이 해주세요</button>\';return \'<button type="button" data-offer="\'+esc(x.id)+\'">🤚 손이 필요해요?</button>\';}\nfunction bindHelp(){\n root.querySelectorAll(\'[data-offer]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.offer);if(x.helpOffer?.status===\'pending\')throw new Error(\'이미 제안 중이에요.\');x.helpOffer={status:\'pending\',by:actor.display_name,at:new Date().toISOString()};},\'🤚 \'+actor.display_name+\'님이 도움을 제안했어요\');});\n root.querySelectorAll(\'[data-offer-cancel]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const o=find(b.dataset.offerCancel).helpOffer;if(o?.by===actor.display_name)o.status=\'cancelled\';},\'도움 제안을 취소했어요\');});\n root.querySelectorAll(\'[data-offer-accept]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.offerAccept),o=x.helpOffer;if(o?.status!==\'pending\'||o.by===actor.display_name)throw new Error(\'상대방이 수락해야 해요.\');o.status=\'accepted\';o.acceptedBy=actor.display_name;o.acceptedAt=new Date().toISOString();state.comments=state.comments||[];state.comments.unshift({id:crypto.randomUUID(),taskId:x.id,author:actor.display_name,text:\'🤚 \'+o.by+\'님, 같이 해주세요. 도움 제안을 수락했어요.\',at:o.acceptedAt,readBy:[actor.display_name]});},\'도움 제안을 수락했어요\');});\n root.querySelectorAll(\'[data-help-request]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>{helpTaskId=b.dataset.helpRequest;q(\'help-kind\').value=\'handoff\';q(\'help-reason\').value=\'\';q(\'help-dialog\').showModal();};});\n root.querySelectorAll(\'[data-help-cancel]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.helpCancel);if(x.helpRequest?.by===actor.display_name)x.helpRequest.status=\'cancelled\';},\'도움 요청을 취소했어요\');});\n root.querySelectorAll(\'[data-help-accept]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const x=find(b.dataset.helpAccept),h=x.helpRequest;if(h?.status!==\'pending\'||h.by===actor.display_name)throw new Error(\'이미 처리된 요청이에요.\');h.status=\'accepted\';h.acceptedBy=actor.display_name;h.acceptedAt=new Date().toISOString();if(h.kind===\'handoff\')x.owner=actor.display_name===\'Jayna\'?\'제이나\':actor.display_name;state.comments=state.comments||[];state.comments.unshift({id:crypto.randomUUID(),taskId:x.id,author:actor.display_name,text:h.kind===\'assist\'?\'🙋 함께 도와줄게요.\':\'🙋 제가 맡아서 할게요.\',at:h.acceptedAt,readBy:[actor.display_name]});},\'🙋 \'+actor.display_name+\'님이 도움 요청을 맡았어요\');});\n}\nfunction taskJumpLink(x){return \'<button type="button" class="task-jump-link" data-task-jump="\'+esc(x.id)+\'">\'+esc(title(x))+\'</button>\';}\nfunction jumpToTask(id){const x=find(id);if(!x)return;let target=root.querySelector(\'#active-list [data-item-row="\'+CSS.escape(id)+\'"]\');if(!target){const b=root.querySelector(\'#active-list [data-edit="\'+CSS.escape(id)+\'"]\')||root.querySelector(\'#complete-list [data-edit="\'+CSS.escape(id)+\'"]\')||root.querySelector(\'#daily-list [data-edit="\'+CSS.escape(id)+\'"]\');target=b?.closest(\'.line,.daily-grid,tr\');}if(!target){const b=Array.from(root.querySelectorAll(\'[data-unarchive]\')).find(b=>b.dataset.unarchive===(x.area||\'미분류\'));target=b?.closest(\'.line\');}if(!target){notify(\'현재 목록에서 이 업무를 찾을 수 없어요.\');return;}for(let p=target.parentElement;p&&p!==root;p=p.parentElement)if(p.tagName===\'DETAILS\')p.open=true;target.scrollIntoView({behavior:\'smooth\',block:\'center\'});target.classList.remove(\'jump-highlight\');void target.offsetWidth;target.classList.add(\'jump-highlight\');setTimeout(()=>target.classList.remove(\'jump-highlight\'),2200);}\nfunction needsReply(c){return !!c.replyRequired&&!c.replyResolvedAt&&!c.deletedAt;}\nfunction toggleReply(c){if(needsReply(c)){c.replyResolvedAt=new Date().toISOString();c.replyResolvedBy=actor.display_name;c.readBy=[...new Set([...(c.readBy||[]),actor.display_name])];}else{c.replyRequired=true;c.replyResolvedAt=null;c.replyResolvedBy=null;}}\nfunction replyCount(id){return (state.comments||[]).filter(c=>c.taskId===id&&needsReply(c)).length;}\nfunction feedbackRow(c,showTaskLink=true){\n const item=find(c.taskId),unread=c.author!==actor.display_name&&!(c.readBy||[]).includes(actor.display_name),readers=(c.readBy||[]).filter(n=>n!==c.author);\n return \'<div class="line"><div class="grow"><div class="message-meta"><span>\'+esc(personLabel(c.author))+\' · \'+esc(shortTime(c.at))+\' · 확인: \'+esc(readers.map(personLabel).join(\', \')||(c.author===actor.display_name?\'상대방 확인 대기\':\'대기\'))+\'</span>\'+(c.replyRequired?\'<span class="reply-badge \'+(needsReply(c)?\'\':\'resolved\')+\'">\'+(needsReply(c)?\'답변 필요\':\'답변 완료\')+\'</span><button type="button" data-reply-toggle="\'+esc(c.id)+\'">\'+(needsReply(c)?\'답변 완료\':\'다시 답변 요청\')+\'</button>\':(c.author===actor.display_name?\'<button type="button" data-reply-toggle="\'+esc(c.id)+\'">답변 필요 표시</button>\':\'\'))+(c.author===actor.display_name?\'<button type="button" data-feedback-delete="\'+esc(c.id)+\'">삭제</button>\':\'\')+(unread?\'<button type="button" data-feedback-read="\'+esc(c.id)+\'">확인했어요</button>\':\'\')+\'</div><div class="secondary text-small">\'+(item&&showTaskLink?taskJumpLink(item):esc(item?title(item):\'전체 메모\'))+\'</div><div class="note">\'+esc(c.text)+\'</div>\'+(item&&showTaskLink?\'<div class="actions"><button type="button" data-feedback-task="\'+esc(item.id)+\'">업무 열기 / 답글</button></div>\':\'\')+\'</div></div>\';\n}\nfunction renderFeedback(){\n if(editId)q(\'note-meta\').textContent=noteMeta(find(editId)||{});const comments=(state.comments||[]).filter(c=>!c.deletedAt),pending=comments.filter(c=>needsReply(c)||(c.author===actor.display_name?!(c.readBy||[]).some(n=>n!==c.author):!(c.readBy||[]).includes(actor.display_name)));\n const offerItems=state.items.filter(x=>x.status===\'active\'&&x.helpOffer?.status===\'pending\');const helpItems=state.items.filter(x=>x.status===\'active\'&&x.helpRequest?.status===\'pending\');q(\'feedback-title\').textContent=\'확인할 메모 · \'+(pending.length+helpItems.length+offerItems.length);\n q(\'feedback-pending\').innerHTML=offerItems.map(x=>\'<div class="line"><div class="grow">\'+taskJumpLink(x)+\'<div class="message-meta">\'+esc(personLabel(x.helpOffer.by))+\' · \'+esc(shortTime(x.helpOffer.at))+\' · 🤚 손이 필요해요?</div><div class="actions">\'+offerControls(x)+\'</div></div></div>\').join(\'\')+helpItems.map(x=>\'<div class="line"><div class="grow">\'+taskJumpLink(x)+\'<div class="message-meta">\'+esc(personLabel(x.helpRequest.by))+\' · \'+esc(shortTime(x.helpRequest.at))+\' · \'+(x.helpRequest.kind===\'assist\'?\'같이 해주세요\':\'이번 주에 못 끝낼 것 같아요\')+\'</div>\'+(x.helpRequest.reason?\'<div class="note">\'+esc(x.helpRequest.reason)+\'</div>\':\'\')+\'<div class="actions">\'+helpControls(x)+\'</div></div></div>\').join(\'\')+pending.map(c=>feedbackRow(c)).join(\'\')||\'<div class="secondary text-small">새로 확인할 메모가 없어요. 전체 의견은 왼쪽 ‘메모·피드백’에서 남겨주세요.</div>\';\n const legacy=find(editId),legacyText=[cleanNote(legacy?.note),legacy?.result].filter(Boolean).join(\'\\n\\n\');\n q(\'task-feedback-list\').innerHTML=(legacyText?\'<div class="line"><div class="grow"><div class="message-meta">기존 메모 · \'+esc(noteMeta(legacy))+\'</div><div class="note">\'+esc(legacyText)+\'</div></div></div>\':\'\')+comments.filter(c=>c.taskId===editId).slice().reverse().map(c=>feedbackRow(c,false)).join(\'\')||\'<div class="secondary text-small">아직 남긴 메모가 없어요.</div>\';\n root.querySelectorAll(\'[data-task-jump]\').forEach(b=>b.onclick=()=>jumpToTask(b.dataset.taskJump));\n root.querySelectorAll(\'[data-feedback-delete]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>{const c=state.comments.find(c=>c.id===b.dataset.feedbackDelete);if(!c||c.author!==actor.display_name||!confirm(\'이 피드백을 삭제할까요?\'))return;mutate(()=>{const target=state.comments.find(x=>x.id===c.id);if(target.author!==actor.display_name)throw new Error(\'본인 글만 삭제할 수 있어요.\');target.deletedAt=new Date().toISOString();},\'본인 피드백을 삭제했어요\');};});\n root.querySelectorAll(\'[data-reply-toggle]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const c=state.comments.find(c=>c.id===b.dataset.replyToggle);if(!c||c.deletedAt)return;toggleReply(c);},\'답변 상태를 저장했어요\');});\n root.querySelectorAll(\'[data-feedback-read]\').forEach(b=>{b.disabled=saving||data.readOnly;b.onclick=()=>mutate(()=>{const c=state.comments.find(c=>c.id===b.dataset.feedbackRead);c.readBy=[...new Set([...(c.readBy||[]),actor.display_name])];},\'메모를 확인했어요\');});\n root.querySelectorAll(\'[data-feedback-task]\').forEach(b=>b.onclick=()=>{if(editId===b.dataset.feedbackTask&&!editorNode.hidden){q(\'task-feedback-text\').focus({preventScroll:false});return;}openEdit(b.dataset.feedbackTask);if(editId===b.dataset.feedbackTask)q(\'task-feedback-text\').focus({preventScroll:false});});\n}\nfunction renderOrders(){\n const summary=state.orderSummary;\n if(!summary){q(\'orders-meta\').textContent=\'원본 엑셀을 불러오면 상태별 진행 건수가 표시돼요.\';q(\'orders-summary\').innerHTML=\'\';q(\'orders-detail\').innerHTML=\'\';return;}\n const orders=summary.orders||[],statuses=[...new Set([\'PENDING\',\'PLANNED\',\'SUBMITTED\',\'CONFIRMED\',\'SHIPPED\',...orders.map(x=>x.status)])];\n const checked=new Date(summary.checkedAt),stale=Date.now()-checked.getTime()>36*60*60*1000;\n const stamp=Number.isNaN(checked.getTime())?\'확인 시각 없음\':checked.toLocaleString(\'ko-KR\',{timeZone:\'America/New_York\',month:\'2-digit\',day:\'2-digit\',hour:\'2-digit\',minute:\'2-digit\',hour12:false});\n const link=safeLink(summary.sourceUrl);\n q(\'orders-meta\').innerHTML=esc(\'원본 확인 \'+stamp+\' (뉴욕) · SENT / 취소 제외\')+(stale?\' <strong style="color:var(--orange)">최신 확인 필요</strong>\':\'\')+(link?\' · <a href="\'+esc(link)+\'" target="_blank" rel="noopener noreferrer">원본 엑셀 ↗</a>\':\'\');\n const cards=[[\'전체\',orders.length],...statuses.map(s=>[s,orders.filter(x=>x.status===s).length])];\n q(\'orders-summary\').innerHTML=cards.map(([s,n])=>\'<button type="button" class="order-card" data-order-status="\'+esc(s)+\'" aria-expanded="\'+(orderStatus===s)+\'" style="\'+(orderStatus===s?\'border-color:var(--blue)\':\'\')+\'"><span>\'+esc(s)+\'</span><strong>\'+n+\'건</strong></button>\').join(\'\');\n const list=orderStatus===\'전체\'?orders:orders.filter(x=>x.status===orderStatus);\n const money=n=>n===null||n===undefined?\'미정\':\'$\'+Number(n).toLocaleString(\'en-US\',{minimumFractionDigits:2,maximumFractionDigits:2});\n q(\'orders-detail\').innerHTML=orderStatus?\'<h4>\'+esc(orderStatus)+\' · \'+list.length+\'건</h4><div class="table-responsive"><table class="table order-table"><thead><tr><th>회사</th><th>금액</th><th>PO / SO</th><th>출고 예정</th><th>출고지</th><th>상태 / 메모</th></tr></thead><tbody>\'+list.map(x=>\'<tr><td>\'+esc(x.customer)+\'</td><td>\'+esc(money(x.amount))+\'</td><td>\'+esc(x.po)+\'<div class="secondary text-small">SO \'+esc(x.so||\'미정\')+\'</div></td><td>\'+esc(x.readyDate?x.readyDate.slice(5).replace(\'-\',\'/\'):\'미정\')+\'</td><td>\'+esc(x.shipFrom)+\'</td><td>\'+esc(x.status)+\'<div class="secondary text-small">\'+esc(x.note)+\'</div></td></tr>\').join(\'\')+(list.length?\'\':\'<tr><td colspan="6">해당 상태의 오더가 없어요.</td></tr>\')+\'</tbody></table></div>\':\'\';\n root.querySelectorAll(\'[data-order-status]\').forEach(b=>b.onclick=()=>{orderStatus=orderStatus===b.dataset.orderStatus?null:b.dataset.orderStatus;renderOrders();});\n}\nfunction sections(){return [...new Set([...(state.sections||[]),...state.items.map(x=>x.area||\'미분류\')])];}\nfunction visibleSections(){return sections().filter(x=>!(state.archivedSections||[]).includes(x));}\nfunction sectionColor(name){if(state.sectionColors?.[name])return state.sectionColors[name];const palette=[\'--blue\',\'--purple\',\'--green\',\'--orange\',\'--red\',\'--yellow\'];let hash=0;for(const c of name)hash=(hash*31+c.charCodeAt(0))>>>0;return palette[hash%palette.length];}\nfunction moveItem(id,area,before){const x=find(id);if(!x)return;const i=state.items.indexOf(x);state.items.splice(i,1);x.area=area;const target=before?state.items.findIndex(y=>y.id===before):-1;if(target>=0)state.items.splice(target,0,x);else{let last=-1;state.items.forEach((y,i)=>{if((y.area||\'미분류\')===area)last=i;});state.items.splice(last<0?state.items.length:last+1,0,x);}}\nconst esc=x=>String(x??\'\').replace(/[&<>"\']/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\nconst notify=s=>q(\'notice\').textContent=s;\nconst title=x=>[x.area,x.title].filter(Boolean).join(\' · \');\nconst safeLink=s=>{try{const u=new URL(s);return [\'https:\',\'http:\'].includes(u.protocol)?u.href:\'\';}catch{return \'\';}};\nconst bytes=x=>new TextEncoder().encode(JSON.stringify(x)).length;\nfunction event(text){state.events.unshift({id:crypto.randomUUID(),text,date:day()});state.events=state.events.slice(0,100);}\nfunction snapshot(){return structuredClone(state);}\nasync function mutate(fn,text){if(data.readOnly){notify(\'미리보기에서는 저장되지 않습니다.\');render();return false;}if(saving){notify(\'저장 중이에요. 잠시 후 다시 눌러주세요.\');return false;}const remote=read(bridge?.widgetState);if(valid(remote))state=structuredClone(remote);const before=structuredClone(state);fn();event(text);const payload={modelContent:{board:snapshot()}};if(!bridge?.setWidgetState){state=before;notify(\'공유 저장에 연결되지 않아 변경하지 않았어요.\');render();return false;}saving=true;render();try{await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));await bridge.setWidgetState(payload);notify(\'저장했어요\');return true;}catch(error){state=structuredClone(read(bridge.widgetState)||before);notify(error.message||\'저장 실패. 다시 시도해주세요.\');return false;}finally{saving=false;render();}}\nconst find=id=>state.items.find(x=>x.id===id);\nfunction sectionHistory(area){const list=state.items.filter(x=>(x.area||\'미분류\')===area&&[\'complete\',\'deleted\'].includes(x.status));return \'<details data-section-history="\'+esc(area)+\'"><summary class="cursor-interaction">완료 기록 (\'+list.length+\')</summary>\'+list.map(x=>\'<div class="line"><div class="grow">\'+esc(x.title)+\'<span class="secondary text-small"> · \'+\'완료\'+\'</span><div class="actions"><button class="btn" data-edit="\'+esc(x.id)+\'" type="button">노트 / 결과물</button><button class="btn" data-reactivate="\'+esc(x.id)+\'" type="button">다시 올리기</button></div></div></div>\').join(\'\')+(list.length?\'\':\'<div class="secondary">아직 기록이 없어요.</div>\')+\'</details>\';}\nlet focusSort={key:null,direction:1};\nlet deadlineSort={key:"due",direction:1};\nfunction sortFocus(items,sort=focusSort){if(!sort.key)return items;const {key,direction}=sort;const rank={\'낮음\':1,\'보통\':2,\'높음\':3,\'긴급\':4,\'매우 높음\':4};const value=x=>key===\'progress\'?(Number(x.progress)||0):key===\'week\'?Number(x.weekGoal===weekStart()):key===\'support\'?(x.helpRequest?.status===\'pending\'?2:x.helpOffer?.status===\'pending\'?1:0):key===\'urgency\'||key===\'importance\'?rank[x[key]]:key===\'owner\'?(x.owner===\'미정\'?\'\':x.owner===\'제이나\'?\'Jayna\':x.owner):x[key];return items.map((x,i)=>({x,i})).sort((a,b)=>{const av=value(a.x),bv=value(b.x),am=av===undefined||av===null||av===\'\',bm=bv===undefined||bv===null||bv===\'\';if(am!==bm)return am?1:-1;const cmp=typeof av===\'number\'&&typeof bv===\'number\'?av-bv:String(av||\'\').localeCompare(String(bv||\'\'),\'ko\',{numeric:true});return cmp*direction||a.i-b.i;}).map(v=>v.x);}\nfunction bindDeadlineSort(){root.querySelectorAll(\'[data-deadline-sort]\').forEach(b=>{const active=deadlineSort.key===b.dataset.deadlineSort;b.textContent=b.dataset.label+(active?(deadlineSort.direction===1?\' ↑\':\' ↓\'):\' ↕\');b.closest(\'th\').setAttribute(\'aria-sort\',active?(deadlineSort.direction===1?\'ascending\':\'descending\'):\'none\');b.onclick=()=>{deadlineSort={key:b.dataset.deadlineSort,direction:active?-deadlineSort.direction:1};render();};});}\nfunction bindFocusSort(){root.querySelectorAll(\'[data-focus-sort]\').forEach(b=>{const active=focusSort.key===b.dataset.focusSort;b.textContent=b.dataset.label+(active?(focusSort.direction===1?\' ↑\':\' ↓\'):\' ↕\');b.closest(\'th\').setAttribute(\'aria-sort\',active?(focusSort.direction===1?\'ascending\':\'descending\'):\'none\');b.onclick=()=>{focusSort={key:b.dataset.focusSort,direction:active?-focusSort.direction:1};render();};});}\nfunction weekStart(date=viewDay){const d=new Date(date+\'T12:00:00Z\');return plus(date,-((d.getUTCDay()+6)%7));}\nfunction progressCell(x){const n=Math.max(0,Math.min(100,Number(x.progress)||0));return \'<span class="task-progress" title="\'+esc(x.progressUpdatedBy?personLabel(x.progressUpdatedBy)+\' · \'+shortTime(x.progressUpdatedAt):\'진행률을 선택해주세요\')+\'"><select class="form-select" data-progress-id="\'+esc(x.id)+\'" aria-label="\'+esc(x.title)+\' 진행률">\'+[0,10,30,50,70,90,100].map(v=>\'<option value="\'+v+\'" \'+(v===n?\'selected\':\'\')+\'>\'+v+\'%</option>\').join(\'\')+\'</select><progress max="100" value="\'+n+\'" aria-label="진행률 \'+n+\'%"></progress></span>\';}\nfunction taskRow(x,area,showArea=false,inlineArea=false){return \'<tr data-item-row="\'+esc(x.id)+\'" data-item-area="\'+esc(area)+\'">\'+(showArea?\'<td><span class="deadline-area" style="border-left:4px solid var(\'+sectionColor(area)+\');padding-left:8px">\'+esc(area)+\'</span></td>\':\'\')+\'<td><div class="title-cell"><button class="btn btn-ghost" data-delete="\'+esc(x.id)+\'" type="button">완료</button><button class="btn btn-ghost" draggable="true" data-drag-item="\'+esc(x.id)+\'" type="button" aria-label="\'+esc(x.title)+\' 업무 이동">↕</button>\'+(inlineArea?\'</div></td><td><span class="focus-area" title="\'+esc(area)+\'" style="border-left:4px solid var(\'+sectionColor(area)+\')">\'+esc(area)+\'</span></td><td><div class="title-cell">\':\'\')+\'<span class="task-name"><input class="form-control" data-title-id="\'+esc(x.id)+\'" value="\'+esc(x.title)+\'" maxlength="100" aria-label="업무 이름 수정"></span>\'+(inlineArea?\'</div></td><td>\':\'\')+progressCell(x)+(inlineArea?\'</td><td class="help-cell">\':\'\')+helpControls(x,inlineArea)+(inlineArea?\' \'+offerControls(x):\'\')+(inlineArea?\'</td>\':\'</div></td>\')+\'<td>\'+priorityCell(x,\'urgency\')+\'</td><td>\'+priorityCell(x,\'importance\')+\'</td><td><select class="form-select" data-owner-id="\'+esc(x.id)+\'" aria-label="담당자">\'+[\'미정\',\'Hugo\',\'제이나\',\'함께\'].map(a=>\'<option value="\'+esc(a)+\'" \'+(a===x.owner?\'selected\':\'\')+\'>\'+esc(personLabel(a))+\'</option>\').join(\'\')+\'</select></td><td>\'+dateCell(x,\'start\')+\'</td><td>\'+dateCell(x,\'due\')+\'</td><td><div class="manage-row">\'+buttons(x)+\'<span class="section-move"><select class="form-select" aria-label="섹션 이동" data-area-id="\'+esc(x.id)+\'">\'+visibleSections().map(a=>\'<option \'+(a===area?\'selected\':\'\')+\'>\'+esc(a)+\'</option>\').join(\'\')+\'</select></span></div></td></tr>\';}\nfunction dateCell(x,key){const date=x[key]||\'\';return \'<div class="date-edit"><button type="button" class="btn btn-ghost" data-date-open="\'+esc(x.id)+\'" data-date-key="\'+key+\'" aria-label="\'+esc(x.title)+\' \'+(key===\'start\'?\'시작일\':\'마감일\')+\' 더블클릭해서 수정">\'+esc(date?date.slice(5).replace(\'-\',\'/\'):\'미정\')+\'</button><input hidden type="date" class="form-control" data-date="\'+key+\'" data-date-id="\'+esc(x.id)+\'" value="\'+esc(date)+\'" aria-label="\'+esc(x.title)+\' \'+(key===\'start\'?\'시작일\':\'마감일\')+\'"></div>\';}\nfunction priorityCell(x,key){const options=key===\'urgency\'?[\'미정\',\'낮음\',\'보통\',\'높음\',\'긴급\']:[\'미정\',\'낮음\',\'보통\',\'높음\',\'매우 높음\'];const value=x[key]||\'미정\';const color={\'미정\':\'#999\',\'낮음\':\'#43c67b\',\'보통\':\'#e6c94c\',\'높음\':\'#ff6868\',\'긴급\':\'#ff6868\',\'매우 높음\':\'#ff6868\'};return \'<select class="form-select priority-dot \'+(key===\'urgency\'&&value===\'긴급\'?\'is-urgent\':\'\')+\'" style="color:\'+color[value]+\'" data-priority="\'+key+\'" data-priority-id="\'+esc(x.id)+\'" aria-label="\'+esc(x.title)+\' \'+(key===\'urgency\'?\'긴급도\':\'중요도\')+\'">\'+options.map(a=>\'<option value="\'+a+\'" style="color:\'+color[a]+\'" \'+(a===value?\'selected\':\'\')+\'>\'+ (a===\'긴급\'?\'🚨 \':\'● \')+a+\'</option>\').join(\'\')+\'</select>\';}\n\nfunction buttons(x){const count=replyCount(x.id);return \'<div class="actions">\'+(count?\'<span class="reply-badge" title="메모를 열어 답변이 필요한 내용을 확인하세요">답변 필요 \'+count+\'</span>\':\'\')+\'<button class="btn" data-edit="\'+esc(x.id)+\'" type="button">노트 / 결과물\'+(x.note||x.result||x.link?\' •\':\'\')+\'</button></div>\';}\nfunction short(x){return \'<div class="line"><button class="btn btn-ghost" \'+(x.status===\'complete\'?\'data-reactivate\':\'data-delete\')+\'="\'+esc(x.id)+\'" type="button">\'+(x.status===\'complete\'?\'다시 올리기\':\'완료\')+\'</button><div class="grow"><strong>\'+esc(title(x))+\'</strong><div class="secondary text-small">담당 \'+esc(personLabel(x.owner))+\' · \'+(x.doneDate?\'완료 \'+esc(x.doneDate):\'등록 \'+esc(x.added))+\'</div>\'+buttons(x)+\'</div></div>\';}\nfunction openEdit(id,source=null){const location=source?editorLocation(source):editLocation;if(editId===id&&!editorNode.hidden&&source&&location!==editLocation){editLocation=location;root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());syncGroupSpans();mountEditor();return;}if(editId===id&&!editorNode.hidden){if(dirtyEditor)noteDrafts.set(id,{_base:editBase,owner:q(\'edit-owner\').value,start:q(\'edit-start\').value,due:q(\'edit-due\').value,note:q(\'edit-note\').value,result:q(\'edit-result\').value,link:q(\'edit-link\').value,emailSubject:q(\'edit-email\').value});editorNode.hidden=true;root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());syncGroupSpans();editId=null;dirtyEditor=false;return;}if(dirtyEditor){if(editId!==id)notify(\'작성 중인 노트를 저장하거나 닫은 뒤 다른 업무를 열어주세요.\');return;}const original=find(id);if(!original)return;editLocation=location;editBase=structuredClone(noteDrafts.get(id)?._base||original);const x={...original,...(noteDrafts.get(id)||{})};root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());syncGroupSpans();editId=id;dirtyEditor=noteDrafts.has(id);editorNode.hidden=false;q(\'edit-title\').textContent=\'노트 / 결과물\';q(\'edit-owner\').value=x.owner;q(\'edit-start\').value=x.start||\'\';q(\'edit-due\').value=x.due||\'\';q(\'edit-note\').value=cleanNote(x.note);q(\'edit-result\').value=x.result||\'\';q(\'edit-link\').value=x.link||\'\';q(\'edit-email\').value=x.emailSubject||\'\';const link=safeLink(x.link);q(\'result-preview\').innerHTML=link?\'<a href="\'+esc(link)+\'" target="_blank" rel="noopener noreferrer">결과물 열기 ↗</a>\':\'\';renderFeedback();q(\'task-feedback-text\').value=feedbackDrafts.get(id)||\'\';q(\'task-reply-required\').checked=!!replyDrafts.get(id);mountEditor();q(\'task-feedback-text\').focus({preventScroll:true});}\n\nconst tableWidths=new Map();\nconst tableSorts=new Map();\n\nfunction bindTableSorting(){\n root.querySelectorAll(\'table\').forEach((table,index)=>{\n  const tableKey=table.querySelector(\'tbody\')?.id||\'table-\'+index;\n  const headers=Array.from(table.querySelectorAll(\'thead tr,.section-column-labels\'));\n  headers.forEach((header,sectionIndex)=>{\n   if(header.querySelector(\'[data-focus-sort],[data-deadline-sort]\'))return;\n   const key=tableKey+\'-\'+sectionIndex;\n   const cells=Array.from(header.children);\n   function value(row,column){\n    const offset=row.children.length<header.children.length?1:0;const cell=row.children[column-offset];if(!cell)return \'\';\n    const input=cell.querySelector(\'[data-title-id],[data-progress-id],[data-owner-id],[data-date],input,select\');\n    const raw=input?.value??cell.textContent.trim();\n    if(input?.matches(\'[data-progress-id]\'))return Number(raw)||0;\n    return raw.trim();\n   }\n   function apply(){\n    const sort=tableSorts.get(key);if(!sort)return;\n    const rows=[];\n    let row=header.nextElementSibling;\n    while(row&&!row.hasAttribute(\'data-section\')&&!row.classList.contains(\'section-column-labels\')){\n     const next=row.nextElementSibling;\n     if(row.hasAttribute(\'data-item-row\'))rows.push(row);\n     row=next;\n    }\n    if(!rows.length&&header.parentElement.tagName===\'THEAD\'){\n     rows.push(...table.querySelectorAll(\'tbody>[data-item-row]\'));\n    }\n    rows.sort((a,b)=>{\n     const av=value(a,sort.column),bv=value(b,sort.column);\n     return (typeof av===\'number\'&&typeof bv===\'number\'?av-bv:String(av).localeCompare(String(bv),\'ko\',{numeric:true,sensitivity:\'base\'}))*sort.direction;\n    });\n    const container=rows[0]?.parentElement;if(!container)return;\n    const anchor=row;\n    for(const current of rows)container.insertBefore(current,anchor?.parentElement===container?anchor:null);\n    cells.forEach((cell,column)=>cell.setAttribute(\'aria-sort\',column===sort.column?(sort.direction===1?\'ascending\':\'descending\'):\'none\'));\n   }\n   cells.forEach((cell,column)=>{\n    if(cell.classList.contains(\'section-label\')||cell.querySelector(\'.table-sort-label\'))return;\n    const text=cell.textContent.trim();if(!text||text===\'관리\')return;\n    const label=document.createElement(\'button\');label.type=\'button\';label.className=\'table-sort-label\';label.textContent=text+\' ↕\';\n    Array.from(cell.childNodes).filter(n=>!n.classList?.contains(\'column-resizer\')).forEach(n=>n.remove());\n    cell.prepend(label);\n    label.onclick=()=>{const old=tableSorts.get(key);const direction=old?.column===column?-old.direction:1;tableSorts.set(key,{column,direction});apply();cells.forEach((c,i)=>{const b=c.querySelector(\'.table-sort-label\');if(b)b.textContent=b.textContent.replace(/ [↕↑↓]$/,\'\')+(i===column?(direction===1?\' ↑\':\' ↓\'):\' ↕\');});};\n   });\n   apply();\n  });\n });\n}\n\nfunction resizeTables(){\n root.querySelectorAll(\'table\').forEach((table,index)=>{\n  const key=table.querySelector(\'tbody\')?.id||\'table-\'+index;\n  const heads=table.querySelector(\'tr\')?.children;\n  if(!heads||!heads.length)return;\n  // Sectioned tables have a spanning heading before their column labels.\n  const header=Array.from(table.querySelectorAll(\'tr\')).find(row=>row.children.length>1);\n  if(!header)return;\n  const cells=Array.from(header.children);\n  const saved=tableWidths.get(key);\n  let cols=table.querySelector(\'colgroup[data-resizable]\');\n  if(!cols){cols=document.createElement(\'colgroup\');cols.dataset.resizable=\'true\';cells.forEach((cell,i)=>{const col=document.createElement(\'col\');col.style.width=(saved?.[i]||Math.max(64,cell.getBoundingClientRect().width))+\'px\';cols.append(col)});table.prepend(cols);}\n  table.classList.add(\'user-resizable-table\');\n  if(saved)Array.from(cols.children).forEach((col,i)=>{if(saved[i])col.style.width=saved[i]+\'px\'});\n  cells.forEach((cell,i)=>{\n   cell.classList.add(\'resize-column\');\n   if(cell.querySelector(\'.column-resizer\'))return;\n   const handle=document.createElement(\'span\');handle.className=\'column-resizer\';handle.tabIndex=0;handle.role=\'separator\';handle.setAttribute(\'aria-orientation\',\'vertical\');handle.setAttribute(\'aria-label\',(cell.textContent.trim()||\'열\')+\' 폭 조절\');\n   const store=()=>tableWidths.set(key,Array.from(cols.children).map(c=>parseFloat(c.style.width)));\n   function change(width){cols.children[i].style.width=Math.max(60,width)+\'px\';table.style.width=Array.from(cols.children).reduce((sum,col)=>sum+parseFloat(col.style.width),0)+\'px\';store();}\n   handle.onpointerdown=e=>{\n    if(e.button!==0)return;e.preventDefault();e.stopPropagation();\n    const x=e.clientX,width=parseFloat(cols.children[i].style.width);\n    handle.setPointerCapture(e.pointerId);\n    handle.onpointermove=move=>change(width+move.clientX-x);\n    const end=()=>{handle.onpointermove=null;handle.onpointerup=null;handle.onpointercancel=null;};\n    handle.onpointerup=end;handle.onpointercancel=end;\n   };\n   handle.onclick=e=>e.stopPropagation();\n   handle.onkeydown=e=>{if(e.key===\'ArrowLeft\'||e.key===\'ArrowRight\'){e.preventDefault();e.stopPropagation();change(parseFloat(cols.children[i].style.width)+(e.key===\'ArrowRight\'?10:-10));}};\n   cell.append(handle);\n  });\n });\n}\n\nfunction render(){renderOrders();renderFeedback();q(\'my-profile\').textContent=personLabel(actor.display_name);q(\'my-emoji\').innerHTML=emojiChoices.map(e=>\'<option value="\'+e+\'" \'+(e===(state.memberEmoji?.[actor.display_name]||\'\')?\'selected\':\'\')+\'>\'+(e||\'없음\')+\'</option>\').join(\'\');q(\'my-emoji\').disabled=saving||data.readOnly;for(const id of [\'task-owner\',\'edit-owner\'])for(const option of q(id).options){const name=option.getAttribute(\'value\')||option.textContent;option.value=name;option.textContent=personLabel(name);}addHome.append(addForm);root.querySelectorAll(\'[data-inline-add]\').forEach(x=>x.remove());root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());syncGroupSpans();q(\'date-label\').textContent=viewDay+(viewDay===day()?\' · 오늘\':\' · 미리보기\');q(\'real-day\').hidden=viewDay===day();const selectedAddedDay=addedDay||day();q(\'new-title\').textContent=selectedAddedDay.slice(5).replace(\'-\',\'/\')+(selectedAddedDay===day()?\' 오늘 새로 추가된 일\':\' 추가된 일\');const dates=[...new Set([day(),...Array.from({length:7},(_,i)=>plus(day(),-i)),...state.items.filter(x=>!x.imported).map(x=>x.added)])].filter(Boolean).sort((a,b)=>b.localeCompare(a));q(\'added-dates\').innerHTML=dates.map(d=>\'<button class="btn btn-ghost" type="button" data-added-day="\'+esc(d)+\'" aria-pressed="\'+(d===selectedAddedDay)+\'">\'+esc(d.slice(5).replace(\'-\',\'/\'))+(d===day()?\' 오늘\':\'\')+\'</button>\').join(\'\');root.querySelectorAll(\'[data-added-day]\').forEach(b=>b.onclick=()=>{addedDay=b.dataset.addedDay;render();});\nconst chosen=q(\'task-section\').value; q(\'task-section\').innerHTML=visibleSections().map(a=>\'<option value="\'+esc(a)+\'">\'+esc(a)+\'</option>\').join(\'\')+\'<option value="__new__">＋ 새 섹션 만들기</option>\';q(\'task-section\').value=(chosen===\'__new__\'||visibleSections().includes(chosen))?chosen:\'미분류\';q(\'new-section-label\').hidden=q(\'task-section\').value!==\'__new__\';\nconst fresh=state.items.filter(x=>!completions.has(x.id)&&!x.imported&&x.added===selectedAddedDay);q(\'new-list\').innerHTML=fresh.map(short).join(\'\')||\'<div class="secondary">이 날짜에 새로 추가한 일이 없어요.</div>\';\nconst daily=state.items.filter(x=>x.daily&&x.added<=viewDay&&x.status===\'active\'&&!completions.has(x.id));q(\'daily-list\').innerHTML=\'<div class="daily-grid daily-header"><span class="secondary text-small">내 계정으로 체크하면 내 이름과 색깔로 표시됩니다.</span>\'+people.map(p=>\'<span>\'+esc(personLabel(p))+\'</span>\').join(\'\')+\'<span></span></div>\'+daily.map(x=>\'<div class="daily-grid"><span><button class="btn btn-ghost" data-delete="\'+esc(x.id)+\'" type="button">완료</button> \'+esc(x.title)+\'</span>\'+people.map(person=>\'<label class="progress-check"><input class="cursor-interaction" type="checkbox" data-daily="\'+esc(x.id)+\'" data-person="\'+person+\'" aria-label="\'+esc(x.title)+\' \'+person+\' 진행 중" \'+(x.checks?.[viewDay]?.people?.[person]?\'checked\':\'\')+\'></label>\').join(\'\')+\'<button class="btn btn-ghost" data-edit="\'+esc(x.id)+\'" type="button">노트 / 결과물</button><div class="inline-slot grow"></div></div>\').join(\'\');\nconst active=state.items.filter(x=>!x.daily&&x.status===\'active\'&&!completions.has(x.id)&&(x.imported||x.added<=viewDay));q(\'active-title\').textContent=\'전체 업무표 · \'+active.length;\nconst focus=state.items.filter(x=>!x.daily&&x.status===\'active\'&&!completions.has(x.id)&&visibleSections().includes(x.area||\'미분류\')&&([\'높음\',\'긴급\'].includes(x.urgency)||(x.due&&x.due<=plus(weekStart(),6))||x.weekGoal===weekStart()));const urgent=focus.filter(x=>x.urgency===\'긴급\');q(\'urgent-section\').hidden=urgent.length===0;q(\'urgent-title\').textContent=\'🚨 긴급 업무 · \'+urgent.length;q(\'urgent-list\').innerHTML=sortFocus(urgent).map(x=>taskRow(x,x.area||\'미분류\',false,true)).join(\'\')||\'<tr><td colspan="11" class="secondary">현재 긴급으로 지정된 업무가 없어요.</td></tr>\';q(\'focus-list\').innerHTML=sortFocus(focus.filter(x=>x.urgency!==\'긴급\')).map(x=>taskRow(x,x.area||\'미분류\',false,true)).join(\'\')||\'<tr><td colspan="11" class="secondary">업무의 ‘이번 주’를 체크하거나 긴급도·마감일을 지정해주세요.</td></tr>\';\nconst deadlines=state.items.filter(x=>!x.daily&&x.status===\'active\'&&!completions.has(x.id)&&x.due&&visibleSections().includes(x.area||\'미분류\')).sort((a,b)=>a.due.localeCompare(b.due)||a.title.localeCompare(b.title));q(\'deadline-list\').innerHTML=sortFocus(deadlines,deadlineSort).map(x=>taskRow(x,x.area||\'미분류\',true)).join(\'\')||\'<tr><td colspan="8" class="secondary">마감일을 지정한 업무가 여기에 표시됩니다.</td></tr>\';\nq(\'active-list\').innerHTML=visibleSections().map(area=>{\n const items=active.filter(x=>(x.area||\'미분류\')===area);\n return \'<tr data-section="\'+esc(area)+\'" class="section-column-labels"><td class="section-label" rowspan="\'+(items.length+1)+\'"><h2>\'+esc(area)+\'</h2><button class="btn" data-add-section="\'+esc(area)+\'" type="button">＋ 업무</button><details class="section-settings"><summary>관리</summary><button data-section-up="\'+esc(area)+\'" type="button">위로</button><button data-section-down="\'+esc(area)+\'" type="button">아래로</button><button data-rename="\'+esc(area)+\'" type="button">이름 수정</button><button data-archive-section="\'+esc(area)+\'" type="button">보관</button>\'+sectionHistory(area)+\'<form data-rename-form="\'+esc(area)+\'" hidden><input maxlength="40" required value="\'+esc(area)+\'"><button type="submit">저장</button></form></details></td><th>업무</th><th>긴급도</th><th>중요도</th><th>담당</th><th>시작일</th><th>마감</th><th>관리</th></tr>\'+items.map(x=>taskRow(x,area)).join(\'\');\n}).join(\'\');\n\nconst complete=state.items.filter(x=>x.status===\'complete\');q(\'complete-title\').textContent=\'완료함 · \'+complete.length;q(\'complete-list\').innerHTML=complete.map(short).join(\'\')||\'<div class="secondary">완료한 업무가 여기에 모여요.</div>\';\nq(\'deleted-list\').innerHTML=\'\';\nq(\'event-list\').innerHTML=state.events.map(x=>\'<div class="line"><div>\'+esc(x.text)+\'<div class="secondary text-small">\'+esc(x.date)+\' · \'+esc(x.actor||\'이전 기록\')+\'</div></div></div>\').join(\'\')||\'<div class="secondary">새로 추가하거나 완료하면 기록이 남아요.</div>\';q(\'news-toggle\').textContent=\'🔔 새 소식 \'+state.events.length;\nq(\'daily-history\').innerHTML=state.items.filter(x=>x.daily).flatMap(x=>Object.entries(x.checks||{}).sort(([a],[b])=>b.localeCompare(a)).map(([d,c])=>\'<div class="line">\'+esc(d)+\' · \'+esc(x.title)+\' · \'+esc(c.people?Object.keys(c.people).join(\', \')||\'진행 표시 해제\':\'이전 체크 기록\')+\'</div>\')).join(\'\')||\'<div class="secondary">Daily 진행 기록이 없어요.</div>\';\nroot.querySelectorAll(\'[data-edit]\').forEach(b=>{const x=find(b.dataset.edit);const hasContent=x&&([x.note,x.result,x.link,x.emailSubject].some(v=>String(v||\'\').trim())||(state.comments||[]).some(c=>!c.deletedAt&&c.taskId===x.id&&c.text?.trim()));b.classList.toggle(\'has-note\',!!hasContent);b.textContent=\'노트 / 결과물\'+(hasContent?\' •\':\'\');b.onclick=()=>openEdit(b.dataset.edit,b);});\nroot.querySelectorAll(\'[data-progress-id]\').forEach(b=>b.onchange=()=>{const id=b.dataset.progressId,n=Number(b.value);if(![0,10,30,50,70,90,100].includes(n))return;mutate(()=>{Object.assign(find(id),{progress:n,progressUpdatedBy:actor.display_name,progressUpdatedAt:new Date().toISOString()});},find(id).title+\' 진행률 \'+n+\'%\');});\nroot.querySelectorAll(\'[data-reactivate]\').forEach(b=>b.onclick=()=>mutate(()=>{const item=find(b.dataset.reactivate);item.status=\'active\';item.doneDate=\'\';if(item.reviewKind===\'complete\'){item.needsReview=false;item.reviewKind=\'note\';}},find(b.dataset.reactivate).title+\' 다시 올렸어요\'));\nconst pending=state.items.filter(x=>x.needsReview&&x.status!==\'deleted\');q(\'review-panel\').hidden=!pending.length;q(\'review-title\').textContent=\'업데이트 확인 필요 · \'+pending.length;\nq(\'review-list\').innerHTML=pending.map(x=>{const expanded=openReviews.has(x.id),link=safeLink(x.link);return \'<div class="line"><div class="grow">\'+\'<div class="review-heading"><span class="review-kind \'+(x.reviewKind===\'complete\'?\'review-complete\':\'review-note\')+\'">\'+(x.reviewKind===\'complete\'?\'✅ 업무 완료\':\'📝 새 노트\')+\'</span>\'+taskJumpLink(x)+\'</div>\'+ \'<div class="message-meta"><span>\'+esc(reviewMeta(x))+\'</span>\'+(reviewActor(x)===actor.display_name?\'<span class="secondary">상대방 확인 대기</span>\':\'\')+\'</div><div class="actions">\'+(reviewActor(x)===actor.display_name?\'\':\'<button class="btn" data-reviewed="\'+esc(x.id)+\'" type="button">확인했어요</button>\')+\'<button class="btn" data-review-open="\'+esc(x.id)+\'" type="button" aria-expanded="\'+expanded+\'">\'+(expanded?\'내용 닫기\':\'내용 보기\')+\'</button></div>\'+(expanded?\'<div class="details" data-review-content="\'+esc(x.id)+\'"><strong>진행 상황과 노트</strong><div class="note">\'+esc(cleanNote(x.note)||\'작성된 노트가 없어요.\')+\'</div><strong>결과물 메모</strong><div class="note">\'+esc(x.result||\'작성된 결과물 메모가 없어요.\')+\'</div>\'+(link?\'<p><a href="\'+esc(link)+\'" target="_blank" rel="noopener noreferrer">결과물 링크 열기 ↗</a></p>\':\'\')+(x.emailSubject?\'<strong>이메일 제목</strong><div class="note">\'+esc(x.emailSubject)+\'</div>\':\'\')+\'</div>\':\'\')+\'</div></div>\';}).join(\'\');q(\'review-list\').querySelectorAll(\'[data-task-jump]\').forEach(b=>b.onclick=()=>jumpToTask(b.dataset.taskJump));\nroot.querySelectorAll(\'[data-review-open]\').forEach(b=>b.onclick=()=>{const id=b.dataset.reviewOpen;if(openReviews.has(id))openReviews.delete(id);else openReviews.add(id);render();});\nroot.querySelectorAll(\'[data-reviewed]\').forEach(b=>b.onclick=()=>mutate(()=>{if(reviewActor(find(b.dataset.reviewed))===actor.display_name)throw new Error(\'상대방이 확인해야 합니다.\');find(b.dataset.reviewed).needsReview=false;find(b.dataset.reviewed).reviewedAt=day();const item=find(b.dataset.reviewed),field=item.reviewKind===\'complete\'?\'completionReadBy\':\'noteReadBy\';item[field]=[...new Set([...(item[field]||[]),actor.display_name])];},find(b.dataset.reviewed).title+\' 업데이트를 확인했어요\'));\nq(\'archived-sections\').innerHTML=(state.archivedSections||[]).map(area=>\'<div class="line"><div class="grow">\'+esc(area)+\' · \'+state.items.filter(x=>(x.area||\'미분류\')===area&&x.status===\'active\'&&!completions.has(x.id)).length+\'개</div><button class="btn" data-unarchive="\'+esc(area)+\'" type="button">꺼내기</button></div>\').join(\'\')||\'<div class="secondary">보관한 섹션이 없어요.</div>\';\nroot.querySelectorAll(\'[data-archive-section]\').forEach(b=>b.onclick=()=>mutate(()=>{state.archivedSections=[...new Set([...(state.archivedSections||[]),b.dataset.archiveSection])];},b.dataset.archiveSection+\' 섹션을 보관했어요\'));\nroot.querySelectorAll(\'[data-unarchive]\').forEach(b=>b.onclick=()=>mutate(()=>{state.archivedSections=(state.archivedSections||[]).filter(x=>x!==b.dataset.unarchive);},b.dataset.unarchive+\' 섹션을 꺼냈어요\'));\nroot.querySelectorAll(\'[data-status]\').forEach(b=>b.onclick=async()=>{const id=b.dataset.status;const x=find(id);await mutate(()=>{const item=find(id);item.status=item.status===\'complete\'?\'active\':\'complete\';item.doneDate=item.status===\'complete\'?day():\'\';},title(x)+(x.status===\'complete\'?\' 다시 열었어요\':\' 완료했어요\'));});\nroot.querySelectorAll(\'[data-delete]\').forEach(b=>b.onclick=()=>completeNow(b.dataset.delete));\nroot.querySelectorAll(\'[data-restore]\').forEach(b=>b.onclick=async()=>{const id=b.dataset.restore,x=find(id);await mutate(()=>{const item=find(id);item.status=item.previousStatus||\'active\';},title(x)+\' 복원했어요\');});\nroot.querySelectorAll(\'[data-daily]\').forEach(b=>b.onchange=async()=>{const id=b.dataset.daily,on=b.checked,person=b.dataset.person,x=find(id);await mutate(()=>{const item=find(id);item.checks=item.checks||{};const c=item.checks[viewDay]||{date:viewDay};c.people=c.people||{};if(on)c.people[person]=true;else delete c.people[person];item.checks[viewDay]=c;},title(x)+\' \'+person+(on?\' 진행 중으로 표시했어요\':\' 진행 표시를 해제했어요\'));});\nroot.querySelectorAll(\'[data-date]\').forEach(b=>b.onchange=async()=>{const value=b.value,id=b.dataset.dateId,key=b.dataset.date;await mutate(()=>{find(id)[key]=value;},find(id).title+\' \'+(key===\'start\'?\'시작일\':\'마감일\')+\'을 바꿨어요\');});\nroot.querySelectorAll(\'[data-date-open]\').forEach(b=>{b.ondblclick=()=>{const input=b.parentElement.querySelector(\'input\');b.hidden=true;input.hidden=false;input.focus();try{input.showPicker();}catch{}};});\nroot.querySelectorAll(\'[data-week-id]\').forEach(b=>b.onchange=async()=>{const id=b.dataset.weekId,on=b.checked;await mutate(()=>{find(id).weekGoal=on?weekStart():\'\';},find(id).title+(on?\' 이번 주 목표로 표시했어요\':\' 이번 주 목표를 해제했어요\'));});\nroot.querySelectorAll(\'[data-priority]\').forEach(b=>b.onchange=async()=>{const id=b.dataset.priorityId,key=b.dataset.priority,value=b.value;await mutate(()=>{find(id)[key]=value;},find(id).title+\' \'+(key===\'urgency\'?\'긴급도\':\'중요도\')+\'를 \'+value+\'로 바꿨어요\');});\nroot.querySelectorAll(\'[data-title-id]\').forEach(b=>b.onchange=async()=>{const value=b.value.trim(),id=b.dataset.titleId;if(!value){b.value=find(id).title;return;}await mutate(()=>{find(id).title=value;},\'업무 이름을 \'+value+\'으로 바꿨어요\');});\nroot.querySelectorAll(\'[data-owner-id]\').forEach(b=>b.onchange=async()=>{const value=b.value,id=b.dataset.ownerId;await mutate(()=>{find(id).owner=value;},find(id).title+\' 담당을 \'+value+\'로 바꿨어요\');});\nroot.querySelectorAll(\'[data-area-id]\').forEach(b=>b.onchange=async()=>{const area=b.value,id=b.dataset.areaId;await mutate(()=>moveItem(id,area),find(id).title+\'을 \'+area+\' 섹션으로 옮겼어요\');});\nroot.querySelectorAll(\'[data-add-section]\').forEach(b=>b.onclick=()=>{const area=b.dataset.addSection;addSection=addSection===area?null:area;q(\'task-section\').value=area;q(\'new-section-label\').hidden=true;q(\'task-new-section\').required=false;q(\'task-daily\').checked=false;mountAdd();q(\'add-close\').hidden=false;if(addSection)q(\'task-title\').focus({preventScroll:true});});\nroot.querySelectorAll(\'[data-rename]\').forEach(b=>b.onclick=()=>{const form=Array.from(root.querySelectorAll(\'[data-rename-form]\')).find(x=>x.dataset.renameForm===b.dataset.rename);form.hidden=!form.hidden;if(!form.hidden)form.querySelector(\'input\').focus();});\nroot.querySelectorAll(\'[data-rename-form]\').forEach(form=>form.onsubmit=async e=>{e.preventDefault();const old=form.dataset.renameForm,name=form.querySelector(\'input\').value.trim();if(!name||name===old){form.hidden=true;return;}if(sections().includes(name)){notify(\'같은 이름의 섹션이 있어요.\');return;}await mutate(()=>{const color=sectionColor(old);state.sectionColors=state.sectionColors||{};state.sectionColors[name]=color;delete state.sectionColors[old];state.sections=sections().map(x=>x===old?name:x);state.items.forEach(x=>{if((x.area||\'미분류\')===old)x.area=name;});},old+\' 섹션 이름을 \'+name+\'으로 바꿨어요\');});\nfunction clearDrag(){drag=null;root.classList.remove(\'dragging-task\');root.querySelectorAll(\'.drop-before,.drop-after,.drag-source\').forEach(el=>el.classList.remove(\'drop-before\',\'drop-after\',\'drag-source\'));}\nroot.querySelectorAll(\'[data-drag-item],[data-drag-section]\').forEach(b=>{b.ondragstart=e=>{if(dirtyEditor||saving){e.preventDefault();notify(\'저장이 끝난 뒤 이동해주세요.\');return;}drag=b.dataset.dragItem?{type:\'item\',id:b.dataset.dragItem,body:b.closest(\'tbody\'),ids:[...b.closest(\'tbody\').querySelectorAll(\'[data-item-row]\')].map(r=>r.dataset.itemRow)}:{type:\'section\',area:b.dataset.dragSection};root.classList.add(\'dragging-task\');b.closest(\'tr\')?.classList.add(\'drag-source\');e.dataTransfer.setData(\'text/plain\',b.dataset.dragItem||b.dataset.dragSection);e.dataTransfer.effectAllowed=\'move\';};b.ondragend=clearDrag;});\nroot.querySelectorAll(\'[data-section],[data-item-row]\').forEach(b=>{b.ondragover=e=>{if(!drag)return;if(drag.type===\'item\'&&(!b.dataset.itemRow||b.closest(\'tbody\')!==drag.body))return;e.preventDefault();e.dataTransfer.dropEffect=\'move\';root.querySelectorAll(\'.drop-before,.drop-after\').forEach(el=>el.classList.remove(\'drop-before\',\'drop-after\'));b.classList.add(e.clientY>b.getBoundingClientRect().top+b.getBoundingClientRect().height/2?\'drop-after\':\'drop-before\');};b.ondrop=async e=>{e.preventDefault();if(!drag)return;const d=drag,after=e.clientY>b.getBoundingClientRect().top+b.getBoundingClientRect().height/2;clearDrag();const area=b.dataset.section||b.dataset.itemArea;if(d.type===\'section\'){await mutate(()=>{const list=sections();const from=list.indexOf(d.area),to=list.indexOf(area);if(from<0||to<0||from===to)return;list.splice(from,1);list.splice(list.indexOf(area),0,d.area);state.sections=list;},\'섹션 순서를 바꿨어요\');}else if(b.dataset.itemRow&&d.id!==b.dataset.itemRow&&b.closest(\'tbody\')===d.body){const ids=d.ids.filter(id=>id!==d.id);ids.splice(ids.indexOf(b.dataset.itemRow)+(after?1:0),0,d.id);if([\'focus-list\',\'urgent-list\'].includes(d.body.id))focusSort={key:null,direction:1};if(d.body.id===\'deadline-list\')deadlineSort={key:null,direction:1};await mutate(()=>{const ordered=ids.map(find).filter(Boolean),set=new Set(ids);let i=0;state.items=state.items.map(item=>set.has(item.id)?ordered[i++]:item);},\'업무 순서를 바꿨어요\');}};});\nfor(const [attr,delta] of [[\'sectionUp\',-1],[\'sectionDown\',1]])root.querySelectorAll(\'[data-\'+(delta<0?\'section-up\':\'section-down\')+\']\').forEach(b=>b.onclick=()=>mutate(()=>{const list=sections(),i=list.indexOf(b.dataset[attr]),j=i+delta;if(j>=0&&j<list.length){[list[i],list[j]]=[list[j],list[i]];state.sections=list;}},\'섹션 순서를 바꿨어요\'));\nfor(const [attr,delta] of [[\'itemUp\',-1],[\'itemDown\',1]])root.querySelectorAll(\'[data-\'+(delta<0?\'item-up\':\'item-down\')+\']\').forEach(b=>b.onclick=()=>mutate(()=>{const id=b.dataset[attr],x=find(id),list=state.items.filter(y=>y.status===\'active\'&&!y.daily&&(y.area||\'미분류\')===(x.area||\'미분류\')),i=list.findIndex(y=>y.id===id),other=list[i+delta];if(other){const a=state.items.indexOf(x),z=state.items.indexOf(other);[state.items[a],state.items[z]]=[state.items[z],state.items[a]];}},\'업무 순서를 바꿨어요\'));\nroot.style.setProperty(\'--daily-columns\',people.length);root.querySelectorAll(\'[data-daily]\').forEach(b=>{b.disabled=saving||b.dataset.person!==actor.display_name||data.readOnly;b.style.accentColor=data.members.find(m=>m.display_name===b.dataset.person)?.color||\'#4285f4\';});root.querySelectorAll(\'button\').forEach(b=>{if(b.id!==\'news-toggle\'&&!b.hasAttribute(\'data-delete\'))b.disabled=saving;});\nmountEditor();mountAdd();bindHelp();bindFocusSort();bindDeadlineSort();resizeTables();bindTableSorting();\n}\nq(\'task-reply-required\').onchange=()=>replyDrafts.set(editId,q(\'task-reply-required\').checked);\nq(\'task-feedback-text\').oninput=()=>feedbackDrafts.set(editId,q(\'task-feedback-text\').value);\nq(\'task-feedback-form\').onsubmit=async e=>{e.preventDefault();const id=editId,text=q(\'task-feedback-text\').value.trim();if(!id||!text){notify(\'메모를 입력해주세요.\');return;}if((state.comments||[]).length>=500){notify(\'메모가 500개에 도달했어요. 기록 정리가 필요합니다.\');return;}const comment={id:crypto.randomUUID(),taskId:id,author:actor.display_name,text,at:new Date().toISOString(),readBy:[actor.display_name],replyRequired:q(\'task-reply-required\').checked};const ok=await mutate(()=>{state.comments=state.comments||[];state.comments.unshift(comment);},title(find(id))+\' 메모를 남겼어요\');if(ok){feedbackDrafts.delete(id);replyDrafts.delete(id);if(editId===id){q(\'task-feedback-text\').value=\'\';q(\'task-reply-required\').checked=false;}}};\nq(\'my-emoji\').onchange=async()=>{const emoji=q(\'my-emoji\').value;if(!emojiChoices.includes(emoji))return;await mutate(()=>{state.memberEmoji=state.memberEmoji||{};state.memberEmoji[actor.display_name]=emoji;},actor.display_name+\' 이모지를 바꿨어요\');};\nq(\'help-close\').onclick=()=>q(\'help-dialog\').close();\nq(\'help-form\').onsubmit=async e=>{e.preventDefault();const id=helpTaskId,kind=q(\'help-kind\').value,reason=q(\'help-reason\').value.trim();const ok=await mutate(()=>{const x=find(id);if(!x||x.status!==\'active\'||x.helpRequest?.status===\'pending\')throw new Error(\'이미 요청 중이거나 완료된 업무예요.\');x.helpRequest={status:\'pending\',kind,reason,by:actor.display_name,at:new Date().toISOString()};},\'도움 요청을 남겼어요\');if(ok)q(\'help-dialog\').close();};\nq(\'review-toggle\').onclick=()=>{const content=q(\'review-list\');content.hidden=!content.hidden;q(\'review-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'review-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'feedback-toggle\').onclick=()=>{const content=q(\'feedback-pending\');content.hidden=!content.hidden;q(\'feedback-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'feedback-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'new-toggle\').onclick=()=>{const content=q(\'new-content\');content.hidden=!content.hidden;q(\'new-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'new-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'daily-toggle\').onclick=()=>{const content=q(\'daily-content\');content.hidden=!content.hidden;q(\'daily-toggle\').textContent=content.hidden?\'▸ 펼치기\':\'▾ 접기\';q(\'daily-toggle\').setAttribute(\'aria-expanded\',String(!content.hidden));};\nq(\'daily-add-toggle\').onclick=()=>{q(\'daily-content\').hidden=false;q(\'daily-toggle\').textContent=\'▾ 접기\';q(\'daily-toggle\').setAttribute(\'aria-expanded\',\'true\');const form=q(\'daily-add-form\');form.hidden=!form.hidden;q(\'daily-add-toggle\').setAttribute(\'aria-expanded\',String(!form.hidden));if(!form.hidden)q(\'daily-add-title\').focus({preventScroll:true});};\nq(\'daily-add-close\').onclick=()=>{q(\'daily-add-form\').hidden=true;q(\'daily-add-toggle\').setAttribute(\'aria-expanded\',\'false\');};\nq(\'daily-add-form\').onsubmit=async e=>{e.preventDefault();const t=q(\'daily-add-title\').value.trim();if(!t)return;const input={id:crypto.randomUUID(),area:\'미분류\',title:t,owner:\'미정\',start:day(),due:\'\',added:day(),note:\'\',result:\'\',link:\'\',daily:true,checks:{},status:\'active\'};const ok=await mutate(()=>state.items.push(input),t+\' Daily 할 일에 추가했어요\');if(ok){q(\'daily-add-title\').value=\'\';q(\'daily-add-form\').hidden=true;q(\'daily-add-toggle\').setAttribute(\'aria-expanded\',\'false\');viewDay=day();render();}};\nq(\'add-form\').onsubmit=async e=>{e.preventDefault();const t=q(\'task-title\').value.trim();if(!t)return;const create=q(\'task-section\').value===\'__new__\',area=create?q(\'task-new-section\').value.trim():q(\'task-section\').value;if(!area){notify(\'새 섹션 이름을 입력해주세요.\');return;}if(create&&sections().includes(area)){notify(\'이미 있는 섹션이에요. 목록에서 선택해주세요.\');return;}if(create&&sections().length>=25){notify(\'섹션은 25개까지 만들 수 있어요.\');return;}const link=q(\'task-link\').value.trim();if(link&&!safeLink(link)){notify(\'결과물 링크는 http 또는 https 주소로 적어주세요.\');return;}const feedback=q(\'task-feedback\').value.trim();if(feedback&&(state.comments||[]).length>=500){notify(\'메모가 500개에 도달했어요.\');return;}const input={id:crypto.randomUUID(),area,title:t,owner:q(\'task-owner\').value,start:day(),due:q(\'task-due\').value,urgency:q(\'task-urgency\').value,importance:q(\'task-importance\').value,added:day(),note:q(\'task-note\').value.trim(),result:q(\'task-result\').value.trim(),link,emailSubject:q(\'task-email\').value.trim(),daily:q(\'task-daily\').checked,weekGoal:q(\'task-week\').checked?weekStart(day()):\'\',checks:{},status:\'active\'};if(input.note||input.result||input.link||input.emailSubject){input.needsReview=true;input.reviewKind=\'note\';input.noteUpdatedBy=actor.display_name;input.noteUpdatedAt=day();input.noteUpdatedTime=new Date().toISOString();input.noteReadBy=[];}const ok=await mutate(()=>{if(create)state.sections=[...sections(),area];state.items.push(input);if(feedback){state.comments=state.comments||[];state.comments.unshift({id:crypto.randomUUID(),taskId:input.id,author:actor.display_name,text:feedback,at:new Date().toISOString(),readBy:[actor.display_name]});}},t+\' 새로 추가했어요\');if(ok){q(\'task-title\').value=\'\';for(const id of [\'task-note\',\'task-feedback\',\'task-result\',\'task-link\',\'task-email\'])q(id).value=\'\';q(\'task-week\').checked=false;q(\'task-urgency\').value=\'미정\';q(\'task-importance\').value=\'미정\';viewDay=day();addedDay=null;addSection=null;q(\'add-close\').hidden=false;render();}};\nq(\'add-close\').onclick=()=>{addSection=null;mountAdd();addHome.open=false;q(\'add-home-section\').hidden=true;q(\'top-add-toggle\').textContent=\'＋ 새 업무 추가\';q(\'top-add-toggle\').setAttribute(\'aria-expanded\',\'false\');};q(\'top-add-toggle\').onclick=()=>{addHome.open=!addHome.open;q(\'add-home-section\').hidden=!addHome.open;};addHome.ontoggle=()=>{q(\'top-add-toggle\').textContent=addHome.open?\'▾ 입력창 접기\':\'＋ 새 업무 추가\';q(\'top-add-toggle\').setAttribute(\'aria-expanded\',String(addHome.open));q(\'add-home-section\').hidden=!addHome.open;addHome.querySelector(\'summary\').textContent=addHome.open?\'▾ 입력창 접기\':\'＋ 새 업무 추가\';if(addHome.open&&addSection){addSection=null;mountAdd();q(\'add-close\').hidden=false;}};\nq(\'task-section\').onchange=()=>{q(\'new-section-label\').hidden=q(\'task-section\').value!==\'__new__\';q(\'task-new-section\').required=q(\'task-section\').value===\'__new__\';};\nq(\'edit-form\').oninput=()=>dirtyEditor=true;\nq(\'edit-form\').onsubmit=async e=>{e.preventDefault();const id=editId,x=find(id);if(!x)return;const link=q(\'edit-link\').value.trim();if(link&&!safeLink(link)){notify(\'결과물 링크는 http 또는 https 주소로 적어주세요.\');return;}const values={owner:q(\'edit-owner\').value,start:q(\'edit-start\').value,due:q(\'edit-due\').value,emailSubject:q(\'edit-email\').value,link};const remoteItem=read(bridge.widgetState)?.items.find(item=>item.id===id);const updates=Object.fromEntries(Object.entries(values).filter(([k,v])=>v!==(editBase?.[k]||\'\')));if(Object.keys(updates).some(k=>(remoteItem?.[k]||\'\')!==(editBase?.[k]||\'\'))){notify(\'다른 팀원이 이 노트를 수정했어요. 작성한 내용은 유지됩니다. 최신 내용을 확인하고 다시 작성해주세요.\');return;}const changed=[\'link\',\'emailSubject\'].some(k=>(x[k]||\'\')!==(values[k]||\'\'));const ok=await mutate(()=>{Object.assign(find(id),updates);if(changed){find(id).needsReview=true;find(id).reviewKind=\'note\';find(id).noteUpdatedAt=day();find(id).noteUpdatedBy=actor.display_name;find(id).noteUpdatedTime=new Date().toISOString();find(id).noteReadBy=[];}},title(x)+\' 노트 / 결과물을 업데이트했어요\');if(ok){noteDrafts.delete(id);q(\'edit-close\').onclick();}};\nq(\'edit-close\').onclick=()=>{editorNode.hidden=true;root.append(editorNode);root.querySelectorAll(\'[data-inline-editor]\').forEach(x=>x.remove());syncGroupSpans();editId=null;dirtyEditor=false;};\nq(\'news-toggle\').onclick=()=>q(\'news-panel\').hidden=!q(\'news-panel\').hidden;q(\'next-day\').onclick=()=>{viewDay=plus(viewDay,1);render();};q(\'real-day\').onclick=()=>{viewDay=day();render();};\nparentElement._operation={root,receive(nextData){\n  bridge.widgetState={modelContent:{board:nextData.board}};\n  const changed=revision!==nextData.revision;revision=nextData.revision;\n  if(pending&&nextData.ack?.id===pending.id){const request=pending;pending=null;if(nextData.ack.ok)request.resolve();else request.reject(new Error(nextData.ack.message||\'다른 팀원이 먼저 수정했어요. 최신 내용으로 다시 시도해주세요.\'));return;}\n  const next=read(bridge.widgetState);if(!valid(next)||saving)return;\n  const focused=parentElement.activeElement;\n  if(changed&&!dirtyEditor&&!(focused&&[\'INPUT\',\'TEXTAREA\',\'SELECT\'].includes(focused.tagName))){const fresh=next.events.filter(x=>!seen.has(x.id));state=structuredClone(next);seen=new Set(next.events.map(x=>x.id));render();if(fresh.length)notify((fresh[0].actor?fresh[0].actor+\' · \':\'\')+fresh[0].text);}\n}};\nlet last=day();\nconst poll=setInterval(()=>{if(!root.isConnected){clearInterval(poll);return;}const now=day();if(now!==last){if(viewDay===last)viewDay=now;last=now;render();}if(!saving&&!dirtyEditor&&!drag)setTriggerValue(\'refresh\',Date.now());},5000);\nq(\'updates-toggle\').onclick=()=>{const content=q(\'updates-group\');content.hidden=!content.hidden;const collapsed=content.hidden;q(\'updates-toggle\').textContent=collapsed?\'▸ 업데이트 펼치기\':\'▾ 업데이트 접기\';q(\'updates-toggle\').setAttribute(\'aria-expanded\',String(!collapsed));if(collapsed){q(\'news-panel\').hidden=true;q(\'weekly-section\').scrollIntoView({behavior:\'smooth\',block:\'start\'});}};\nrender();\n}\n'
+
+
+
+
+
+
+
+
+
+@st.cache_resource
+
+
+
+
+
+def login_storage():
+
+
+
+
+
+    return st.components.v2.component("operation_login_storage", html="<span></span>", js="""
+
+
+
+
+
+export default function({parentElement,data,setTriggerValue}) {
+
+
+
+
+
+  if (parentElement._loginCommand === data.id) return;
+
+
+
+
+
+  parentElement._loginCommand = data.id;
+
+
+
+
+
+  try {
+
+
+
+
+
+    let token = null;
+
+
+
+
+
+    if (data.action === 'store') localStorage.setItem(data.key, data.token);
+
+
+
+
+
+    if (data.action === 'clear') localStorage.removeItem(data.key);
+
+
+
+
+
+    if (data.action === 'restore') token = localStorage.getItem(data.key);
+
+
+
+
+
+    setTriggerValue('reply', {id:data.id, token, ok:true});
+
+
+
+
+
+  } catch (_) { setTriggerValue('reply', {id:data.id, ok:false}); }
+
+
+
+
+
+}
+
+
+
+
+
+""")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def restore_login():
+
+
+
+
+
+    if "login_storage_command" not in st.session_state:
+
+
+
+
+
+        st.session_state.login_storage_command = {"id": str(uuid.uuid4()), "action": "restore"}
+
+
+
+
+
+    command = st.session_state.login_storage_command
+
+
+
+
+
+    result = login_storage()(data={**command, "key": "operation-login:" + URL}, key="login_storage", on_reply_change=lambda: None, height=0)
+
+
+
+
+
+    reply = result.get("reply")
+
+
+
+
+
+    if reply and reply.get("id") == command["id"] and st.session_state.get("login_storage_handled") != command["id"]:
+
+
+
+
+
+        st.session_state.login_storage_handled = command["id"]
+
+
+
+
+
+        st.session_state.login_storage_ready = True
+
+
+
+
+
+        if command["action"] == "restore" and reply.get("token"):
+
+
+
+
+
+            try:
+
+
+
+
+
+                session = api("/auth/v1/token?grant_type=refresh_token", "POST", {"refresh_token": reply["token"]})
+
+
+
+
+
+                api("/auth/v1/user", token=session["access_token"])
+
+
+
+
+
+                session.setdefault("expires_at", time.time() + session.get("expires_in", 3600))
+
+
+
+
+
+                st.session_state.auth = session
+
+
+
+
+
+                st.session_state.remember_login = True
+
+
+
+
+
+                queue_login_storage("store", session["refresh_token"])
+
+
+
+
+
+                st.rerun()
+
+
+
+
+
+            except (RuntimeError, urllib.error.URLError):
+
+
+
+
+
+                queue_login_storage("clear")
+
+
+
+
+
+                st.rerun()
+
+
+
+
+
+        if not reply.get("ok"):
+
+
+
+
+
+            st.caption("브라우저의 저장 제한으로 로그인 유지가 안 될 수 있습니다.")
+
+
+
+
+
+    if not st.session_state.get("login_storage_ready"):
+
+
+
+
+
+        st.caption("로그인 상태를 확인하고 있어요…")
+
+
+
+
+
+        if st.button("로그인 화면으로 계속"):
+
+
+
+
+
+            st.session_state.login_storage_ready = True
+
+
+
+
+
+            st.rerun()
+
+
+
+
+
+        st.stop()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def queue_login_storage(action, token=None):
+
+
+
+
+
+    st.session_state.login_storage_command = {"id": str(uuid.uuid4()), "action": action, "token": token}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@st.cache_resource
+
+
+
+
+
+def board_component(html, js, css):
+
+
+
+
+
+    version = hashlib.sha256((html + js + css).encode()).hexdigest()[:12]
+
+
+
+
+
+    return st.components.v2.component(
+
+
+
+
+
+        "operation_board_" + version, html=html, js=js, css=css,
+
+
+
+
+
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+preview = False
+
+
+
+
+
+if not URL or not KEY:
+
+
+
+
+
+    st.error("서버 연결 설정이 필요합니다.")
+
+
+
+
+
+    st.stop()
+
+
+
+
+
+st.markdown("<style>.block-container{padding-top:1.5rem}</style>", unsafe_allow_html=True)
+
+
+
+
+
+def save_feedback_update(update, message):
+
+
+
+
+
+    request_id = str(uuid.uuid4())
+
+
+
+
+
+    for attempt in range(3):
+
+
+
+
+
+        latest = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)[0]
+
+
+
+
+
+        update(latest["body"])
+
+
+
+
+
+        saved = api("/rest/v1/rpc/operation_save", "POST", {
+
+
+
+
+
+            "p_expected_revision": latest["revision"], "p_body": latest["body"],
+
+
+
+
+
+            "p_request_id": request_id, "p_message": message,
+
+
+
+
+
+        }, token=token)
+
+
+
+
+
+        if saved.get("ok"):
+
+
+
+
+
+            return
+
+
+
+
+
+    raise RuntimeError("다른 변경과 겹쳤어요. 다시 눌러주세요.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@st.dialog("삭제할까요?")
+
+
+
+
+
+def confirm_feedback_delete(comment_id):
+
+
+
+
+
+    st.write("이 피드백을 삭제할까요?")
+
+
+
+
+
+    yes, no = st.columns(2)
+
+
+
+
+
+    if yes.button("삭제", key="confirm_feedback_delete"):
+
+
+
+
+
+        try:
+
+
+
+
+
+            def remove(body):
+
+
+
+
+
+                target = next(c for c in body.get("comments", []) if c["id"] == comment_id)
+
+
+
+
+
+                if target.get("author") != actor["display_name"]:
+
+
+
+
+
+                    raise RuntimeError("본인 글만 삭제할 수 있어요.")
+
+
+
+
+
+                target["deletedAt"] = datetime.now(timezone.utc).isoformat()
+
+
+
+
+
+            save_feedback_update(remove, "본인 피드백을 삭제했어요")
+
+
+
+
+
+            st.rerun()
+
+
+
+
+
+        except (RuntimeError, urllib.error.URLError) as error:
+
+
+
+
+
+            st.error(str(error))
+
+
+
+
+
+    if no.button("취소", key="cancel_feedback_delete"):
+
+
+
+
+
+        st.rerun()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not preview:
+
+
+
+
+
+    restore_login()
+
+
+
+
+
+if not preview and not st.session_state.get("auth"):
+
+
+
+
+
+    st.caption("회사 이메일로 로그인하면 체크와 수정 기록에 내 이름이 남습니다.")
+
+
+
+
+
+    with st.form("login"):
+
+
+
+
+
+        email = st.text_input("이메일")
+
+
+
+
+
+        password = st.text_input("비밀번호", type="password")
+
+
+
+
+
+        remember_login = st.checkbox("이 브라우저에서 로그인 유지", value=True)
+
+
+
+
+
+        login = st.form_submit_button("로그인", type="primary")
+
+
+
+
+
+    if login:
+
+
+
+
+
+        try:
+
+
+
+
+
+            session = api("/auth/v1/token?grant_type=password", "POST", {
+
+
+
+
+
+                "email": email.strip(), "password": password,
+
+
+
+
+
+            })
+
+
+
+
+
+            session.setdefault("expires_at", time.time() + session.get("expires_in", 3600))
+
+
+
+
+
+            st.session_state.auth = session
+
+
+
+
+
+            st.session_state.remember_login = remember_login
+
+
+
+
+
+            queue_login_storage("store" if remember_login else "clear", session.get("refresh_token") if remember_login else None)
+
+
+
+
+
+            st.rerun()
+
+
+
+
+
+        except RuntimeError:
+
+
+
+
+
+            st.error("로그인하지 못했어요. 이메일·비밀번호와 이메일 인증 여부를 확인해주세요.")
+
+
+
+
+
+    with st.expander("처음 사용하는 경우 · 계정 만들기"):
+
+
+
+
+
+        with st.form("signup"):
+
+
+
+
+
+            signup_email = st.text_input("회사 이메일", key="signup_email")
+
+
+
+
+
+            signup_password = st.text_input("비밀번호 (8자 이상)", type="password", key="signup_password")
+
+
+
+
+
+            signup = st.form_submit_button("계정 만들기")
+
+
+
+
+
+        if signup:
+
+
+
+
+
+            if len(signup_password) < 8:
+
+
+
+
+
+                st.error("비밀번호를 8자 이상 입력해주세요.")
+
+
+
+
+
+            else:
+
+
+
+
+
+                try:
+
+
+
+
+
+                    api("/auth/v1/signup", "POST", {"email": signup_email.strip(), "password": signup_password})
+
+
+
+
+
+                    st.info("신규 계정이면 인증 메일을 확인해주세요. 이미 가입한 이메일은 다시 가입해도 비밀번호가 바뀌지 않습니다. 비밀번호를 모르면 아래 ‘비밀번호 재설정’을 이용해주세요.")
+
+
+
+
+
+                except RuntimeError:
+
+
+
+
+
+                    st.error("가입 요청을 처리하지 못했어요. Supabase 이메일 가입 설정을 확인해주세요.")
+
+
+
+
+
+    with st.expander("비밀번호 재설정"):
+
+
+
+
+
+        st.caption("회사 이메일로 인증번호를 받은 뒤 새 비밀번호를 정해주세요.")
+
+
+
+
+
+        with st.form("recovery_send"):
+
+
+
+
+
+            recovery_email = st.text_input("재설정할 이메일").strip().lower()
+
+
+
+
+
+            send_recovery = st.form_submit_button("인증번호 이메일 보내기")
+
+
+
+
+
+        if send_recovery:
+
+
+
+
+
+            if not recovery_email or "@" not in recovery_email:
+
+
+
+
+
+                st.error("이메일을 입력해주세요.")
+
+
+
+
+
+            elif time.time() < st.session_state.get("recovery_sent_at", 0) + 60:
+
+
+
+
+
+                st.warning("재발송은 1분 뒤에 시도해주세요.")
+
+
+
+
+
+            else:
+
+
+
+
+
+                try:
+
+
+
+
+
+                    api("/auth/v1/recover", "POST", {"email": recovery_email})
+
+
+
+
+
+                    st.session_state.recovery_email = recovery_email
+
+
+
+
+
+                    st.session_state.recovery_sent_at = time.time()
+
+
+
+
+
+                    st.session_state.pop("recovery_session", None)
+
+
+
+
+
+                    st.success("등록된 이메일이면 재설정 메일이 발송됩니다. 스팸함도 확인해주세요.")
+
+
+
+
+
+                except (RuntimeError, urllib.error.URLError) as error:
+
+
+
+
+
+                    st.error("메일 발송 요청 실패: " + str(error))
+
+
+
+
+
+        with st.form("recovery_verify", clear_on_submit=True):
+
+
+
+
+
+            verify_email = st.text_input("인증할 이메일", value=st.session_state.get("recovery_email", "")).strip().lower()
+
+
+
+
+
+            recovery_code = st.text_input("메일의 인증번호", type="password")
+
+
+
+
+
+            new_password = st.text_input("새 비밀번호 (8자 이상)", type="password")
+
+
+
+
+
+            confirm_password = st.text_input("새 비밀번호 확인", type="password")
+
+
+
+
+
+            reset_password = st.form_submit_button("비밀번호 변경")
+
+
+
+
+
+        if reset_password:
+
+
+
+
+
+            if len(new_password) < 8 or new_password != confirm_password:
+
+
+
+
+
+                st.error("8자 이상의 같은 비밀번호를 두 번 입력해주세요.")
+
+
+
+
+
+            else:
+
+
+
+
+
+                try:
+
+
+
+
+
+                    recovery = st.session_state.get("recovery_session", {})
+
+
+
+
+
+                    if recovery.get("email") != verify_email or recovery.get("expires_at", 0) < time.time():
+
+
+
+
+
+                        verified = api("/auth/v1/verify", "POST", {"email": verify_email, "token": recovery_code.strip(), "type": "recovery"})
+
+
+
+
+
+                        recovery = {"email": verify_email, "access_token": verified["access_token"], "expires_at": time.time() + min(verified.get("expires_in", 3600), 600)}
+
+
+
+
+
+                        st.session_state.recovery_session = recovery
+
+
+
+
+
+                    api("/auth/v1/user", "PUT", {"password": new_password}, token=recovery["access_token"])
+
+
+
+
+
+                    st.session_state.pop("recovery_session", None)
+
+
+
+
+
+                    st.success("비밀번호를 변경했어요. 위 로그인 칸에서 새 비밀번호로 로그인해주세요.")
+
+
+
+
+
+                except (RuntimeError, urllib.error.URLError) as error:
+
+
+
+
+
+                    st.error("비밀번호 재설정 실패: " + str(error))
+
+
+
+
+
+    st.stop()
+
+
+
+
+
+
+
+
+
+
+
+try:
+
+
+
+
+
+    if preview:
+
+
+
+
+
+        row = {"body": json.loads((HERE / "seed.json").read_text(encoding="utf-8")), "revision": 0}
+
+
+
+
+
+        actor = {"display_name": "Hugo", "color": "#4285f4"}
+
+
+
+
+
+        members = [{"display_name": "Hugo", "color": "#4285f4"}, {"display_name": "Jayna", "color": "#b278ed"}]
+
+
+
+
+
+        st.info("화면 미리보기 · 데이터 변경은 저장되지 않습니다.")
+
+
+
+
+
+        token = None
+
+
+
+
+
+    else:
+
+
+
+
+
+        token = session_token()
+
+
+
+
+
+        if st.session_state.get("remember_login"):
+
+
+
+
+
+            refresh = st.session_state.auth["refresh_token"]
+
+
+
+
+
+            if st.session_state.login_storage_command.get("token") != refresh:
+
+
+
+
+
+                queue_login_storage("store", refresh)
+
+
+
+
+
+                st.rerun()
+
+
+
+
+
+        user = api("/auth/v1/user", token=token)
+
+
+
+
+
+        members = api("/rest/v1/operation_members?select=email,display_name,color&order=display_name", token=token)
+
+
+
+
+
+        actor = next((m for m in members if m["email"].lower() == user["email"].lower()), None)
+
+
+
+
+
+        if not actor:
+
+
+
+
+
+            st.error("이 업무판에 등록된 팀원 계정이 아닙니다.")
+
+
+
+
+
+            if st.button("다른 계정으로 로그인"):
+
+
+
+
+
+                st.session_state.clear()
+
+
+
+
+
+                st.rerun()
+
+
+
+
+
+            st.stop()
+
+
+
+
+
+        with st.sidebar:
+
+
+
+
+
+            st.write(f"● {actor['display_name']}")
+
+
+
+
+
+            st.caption("화면은 5초마다 최신 내용을 확인합니다.")
+
+
+
+
+
+            if st.button("로그아웃"):
+
+
+
+
+
+                try:
+
+
+
+
+
+                    api("/auth/v1/logout", "POST", token=token)
+
+
+
+
+
+                finally:
+
+
+
+
+
+                    st.session_state.clear()
+
+
+
+
+
+                    st.session_state.login_storage_ready = True
+
+
+
+
+
+                    queue_login_storage("clear")
+
+
+
+
+
+                    st.rerun()
+
+
+
+
+
+            if st.button("새로고침"):
+
+
+
+
+
+                st.rerun()
+
+
+
+
+
+        rows = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)
+
+
+
+
+
+        if not rows:
+
+
+
+
+
+            st.error("업무판 초기 데이터가 아직 연결되지 않았습니다.")
+
+
+
+
+
+            st.stop()
+
+
+
+
+
+        row = rows[0]
+
+
+
+
+
+except (RuntimeError, urllib.error.URLError):
+
+
+
+
+
+    st.error("공동 저장 서버에 연결하지 못했어요. 변경하지 않고 연결을 다시 확인해주세요.")
+
+
+
+
+
+    if st.button("다시 연결"):
+
+
+
+
+
+        st.rerun()
+
+
+
+
+
+    st.stop()
+
+
+
+
+
+
+
+
+
+
+
+with st.sidebar:
+
+
+
+
+
+    st.markdown("### 메뉴")
+
+
+
+
+
+    page = st.radio("화면", ["업무판", "Weekly · 주간 보고"], label_visibility="collapsed")
+
+
+
+
+
+if page == "Weekly · 주간 보고":
+
+
+
+
+
+    if not preview and not row["body"].get("weeklyTrackingSince"):
+
+
+
+
+
+        save_feedback_update(lambda body: None, "주차별 업무 기록 보관을 시작했어요")
+
+
+
+
+
+        st.rerun()
+
+
+
+
+
+    weekly_render(st, row["body"], actor["display_name"], save_feedback_update)
+
+
+
+
+
+    st.stop()
+
+
+
+
+
+
+
+
+
+
+
+if not preview:
+
+
+
+
+
+    comments = [c for c in row["body"].get("comments", []) if not c.get("deletedAt")]
+
+
+
+
+
+    unread = [c for c in comments if c.get("author") != actor["display_name"]
+
+
+
+
+
+              and actor["display_name"] not in c.get("readBy", [])]
+
+
+
+
+
+    with st.sidebar.expander(f"메모·피드백 · 확인할 {len(unread)}개", expanded=True):
+
+
+
+
+
+        if st.session_state.pop("feedback_clear", False):
+
+
+
+
+
+            st.session_state.feedback_text = ""
+
+
+
+
+
+        tasks = {x["id"]: x for x in row["body"]["items"]}
+
+
+
+
+
+        with st.form("feedback_form"):
+
+
+
+
+
+            feedback_task = st.selectbox("관련 업무", [""] + list(tasks),
+
+
+
+
+
+                format_func=lambda id: "전체 / 자유 메모" if not id else tasks[id].get("area", "") + " · " + tasks[id]["title"])
+
+
+
+
+
+            feedback_text = st.text_area("할 말 / 요청 / 피드백", key="feedback_text", max_chars=1000)
+
+
+
+
+
+            submit_feedback = st.form_submit_button("메모 남기기")
+
+
+
+
+
+        if submit_feedback:
+
+
+
+
+
+            if not feedback_text.strip():
+
+
+
+
+
+                st.warning("메모 내용을 입력해주세요.")
+
+
+
+
+
+            else:
+
+
+
+
+
+                try:
+
+
+
+
+
+                    comment = {"id": str(uuid.uuid4()), "taskId": feedback_task,
+
+
+
+
+
+                        "author": actor["display_name"], "text": feedback_text.strip(),
+
+
+
+
+
+                        "at": datetime.now(timezone.utc).isoformat(), "readBy": [actor["display_name"]]}
+
+
+
+
+
+                    def add_comment(body):
+
+
+
+
+
+                        if len(body.get("comments", [])) >= 500:
+
+
+
+
+
+                            raise RuntimeError("메모가 500개에 도달했어요. 기록 정리가 필요합니다.")
+
+
+
+
+
+                        if not any(c["id"] == comment["id"] for c in body.get("comments", [])):
+
+
+
+
+
+                            body.setdefault("comments", []).insert(0, comment)
+
+
+
+
+
+                    save_feedback_update(add_comment, actor["display_name"] + " 메모·피드백을 남겼어요")
+
+
+
+
+
+                    st.session_state.feedback_clear = True
+
+
+
+
+
+                    st.rerun()
+
+
+
+
+
+                except (RuntimeError, urllib.error.URLError) as error:
+
+
+
+
+
+                    st.error(str(error))
+
+
+
+
+
+        st.caption("업무별 피드백과 전체 메모는 위 ‘확인할 메모’에 표시되고, 내가 쓴 글도 상대방이 확인하기 전까지 보여요.")
+
+
+
+
+
+        with st.expander(f"메모 기록 · {len(comments)}개"):
+
+
+
+
+
+            for c in comments:
+
+
+
+
+
+                task = tasks.get(c.get("taskId"), {})
+
+
+
+
+
+                when = datetime.fromisoformat(c["at"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).strftime("%m/%d %H:%M")
+
+
+
+
+
+                readers = ", ".join(n for n in c.get("readBy", []) if n != c.get("author")) or "대기"
+
+
+
+
+
+                st.caption(c.get("author", "") + " · " + when + " · 확인: " + readers)
+
+
+
+
+
+                st.caption(task.get("title") or "전체 메모")
+
+
+
+
+
+                st.write(c.get("text", ""))
+
+
+
+
+
+                if c.get("author") == actor["display_name"] and st.button("삭제", key="delete_" + c["id"]):
+
+
+
+
+
+                    confirm_feedback_delete(c["id"])
+
+
+
+
+
+                if c in unread and st.button("확인했어요", key="read_" + c["id"]):
+
+
+
+
+
+                    try:
+
+
+
+
+
+                        def mark_read(body):
+
+
+
+
+
+                            target = next(x for x in body.get("comments", []) if x["id"] == c["id"])
+
+
+
+
+
+                            target["readBy"] = list(dict.fromkeys(target.get("readBy", []) + [actor["display_name"]]))
+
+
+
+
+
+                        save_feedback_update(mark_read, "메모를 확인했어요")
+
+
+
+
+
+                        st.rerun()
+
+
+
+
+
+                    except (RuntimeError, urllib.error.URLError) as error:
+
+
+
+
+
+                        st.error(str(error))
+
+
+
+
+
+
+
+
+
+
+
+if not preview:
+
+
+
+
+
+    with st.sidebar.expander("진행 중 오더 · 원본 업데이트"):
+
+
+
+
+
+        order_file = st.file_uploader("Open SO Status 엑셀", type=["xlsx", "xlsm"], key="order_file")
+
+
+
+
+
+        source_link = st.text_input("원본 엑셀 링크", value=row["body"].get("orderSummary", {}).get("sourceUrl", ""))
+
+
+
+
+
+        if st.button("오더 요약 업데이트", disabled=order_file is None):
+
+
+
+
+
+            try:
+
+
+
+
+
+                source_link = source_link.strip()
+
+
+
+
+
+                if source_link and not source_link.startswith("https://"):
+
+
+
+
+
+                    raise ValueError("원본 링크는 https 주소로 입력해주세요.")
+
+
+
+
+
+                summary = parse_order_workbook(order_file.getvalue(), order_file.name, source_link)
+
+
+
+
+
+                for attempt in range(3):
+
+
+
+
+
+                    latest = api("/rest/v1/operation_boards?id=eq.operation&select=body,revision", token=token)[0]
+
+
+
+
+
+                    latest["body"]["orderSummary"] = summary
+
+
+
+
+
+                    saved = api("/rest/v1/rpc/operation_save", "POST", {
+
+
+
+
+
+                        "p_expected_revision": latest["revision"], "p_body": latest["body"],
+
+
+
+
+
+                        "p_request_id": str(uuid.uuid4()), "p_message": "진행 중 오더 요약을 업데이트했어요",
+
+
+
+
+
+                    }, token=token)
+
+
+
+
+
+                    if saved.get("ok"):
+
+
+
+
+
+                        break
+
+
+
+
+
+                if not saved.get("ok"):
+
+
+
+
+
+                    raise ValueError("다른 변경과 겹쳐 저장하지 못했어요. 다시 눌러주세요.")
+
+
+
+
+
+                st.session_state.order_import_success = len(summary["orders"])
+
+
+
+
+
+                st.rerun()
+
+
+
+
+
+            except (ValueError, RuntimeError, KeyError, OSError, SyntaxError) as error:
+
+
+
+
+
+                st.error("오더 업데이트 실패: " + str(error))
+
+
+
+
+
+        if "order_import_success" in st.session_state:
+
+
+
+
+
+            st.success(f"진행 중 {st.session_state.order_import_success}건 저장됨")
+
+
+
+
+
+
+
+
+
+
+
+result = board_component(BOARD_HTML, BOARD_JS, BOARD_CSS)(
+
+
+
+
+
+    data={"board": row["body"], "revision": row["revision"], "actor": actor,
+
+
+
+
+
+          "members": members, "ack": st.session_state.get("ack"), "readOnly": preview},
+
+
+
+
+
+    key="operation", on_change_change=lambda: None, on_refresh_change=lambda: None,
+
+
+
+
+
+)
+
+
+
+
+
+change = result.get("change")
+
+
+
+
+
+if change and change.get("id") != st.session_state.get("handled_request"):
+
+
+
+
+
+    request_id = change["id"]
+
+
+
+
+
+    try:
+
+
+
+
+
+        if preview:
+
+
+
+
+
+            response = {"ok": False, "message": "미리보기에서는 저장되지 않습니다."}
+
+
+
+
+
+        else:
+
+
+
+
+
+            response = api("/rest/v1/rpc/operation_save", "POST", {
+
+
+
+
+
+                "p_expected_revision": change["revision"], "p_body": change["board"],
+
+
+
+
+
+                "p_request_id": request_id, "p_message": change.get("message", "업무판을 업데이트했어요"),
+
+
+
+
+
+            }, token=token)
+
+
+
+
+
+        st.session_state.ack = {"id": request_id, **response}
+
+
+
+
+
+    except (RuntimeError, urllib.error.URLError):
+
+
+
+
+
+        st.session_state.ack = {"id": request_id, "ok": False, "message": "저장 실패. 다시 시도해주세요."}
+
+
+
+
+
+    st.session_state.handled_request = request_id
+
+
+
+
+
+    st.rerun()
+
+
+
+
+
